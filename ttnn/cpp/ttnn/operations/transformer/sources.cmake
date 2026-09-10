@@ -27,6 +27,9 @@ set(TTNN_OP_TRANSFORMER_SRCS
     sdpa_decode/device/sdpa_decode_device_operation.cpp
     sdpa_decode/device/sdpa_decode_program_factory.cpp
     sdpa_decode/sdpa_decode.cpp
+    palu_sdpa_decode/device/palu_sdpa_decode_device_operation.cpp
+    palu_sdpa_decode/device/palu_sdpa_decode_program_factory.cpp
+    palu_sdpa_decode/palu_sdpa_decode.cpp
     split_query_key_value_and_split_heads/split_query_key_value_and_split_heads.cpp
     gated_delta_attn/device/gated_delta_attn_device_operation.cpp
     gated_delta_attn/device/gated_delta_attn_program_factory.cpp
@@ -48,6 +51,7 @@ set(TTNN_OP_TRANSFORMER_NANOBIND_SRCS
     concatenate_heads/concatenate_heads_nanobind.cpp
     sdpa/sdpa_nanobind.cpp
     sdpa_decode/sdpa_decode_nanobind.cpp
+    palu_sdpa_decode/palu_sdpa_decode_nanobind.cpp
     split_query_key_value_and_split_heads/split_query_key_value_and_split_heads_nanobind.cpp
     gated_delta_attn/gated_delta_attn_nanobind.cpp
     chunk_gated_delta_rule/chunk_gated_delta_rule_nanobind.cpp

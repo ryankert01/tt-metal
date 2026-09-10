@@ -17,6 +17,7 @@ file(
     GLOB_RECURSE kernels
     sdpa/device/kernels/*.hpp
     sdpa_decode/device/kernels/*.hpp
+    palu_sdpa_decode/device/kernels/*.hpp
     gated_delta_attn/device/kernels/*.cpp
     chunk_gated_delta_rule/device/kernels/*.cpp
 )
@@ -34,6 +35,7 @@ target_sources(
             sdpa/sparse_sdpa.hpp
             sdpa/sparse_sdpa_msa.hpp
             sdpa_decode/sdpa_decode.hpp
+            palu_sdpa_decode/palu_sdpa_decode.hpp
             split_query_key_value_and_split_heads/split_query_key_value_and_split_heads.hpp
         FILE_SET kernels
         TYPE HEADERS
