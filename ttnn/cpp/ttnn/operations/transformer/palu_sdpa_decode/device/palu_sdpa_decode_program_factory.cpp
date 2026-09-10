@@ -612,6 +612,21 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     const uint32_t w_rot_tiles = 2 * w_rot_block;
     const uint32_t ab_tiles = 2 * Wt;                                                         // one AB row block, ping-pong
     const uint32_t cs_tiles = phase2 ? Sk_chunk_t_cb_size * Wt : 2 * Sk_chunk_t_cb_size * Wt;  // resident table / streamed x2
+    // The reader pushes each of these CBs in one linear block per head/chunk (never wrapping mid-push),
+    // so every CB must be a whole number of its push granule or the write pointer would land inside a
+    // block instead of back at a block boundary. w_rot's granule is one head's block (w_rot_block); the
+    // latent chunk's and the cs table's granule is one chunk (Sk_chunk_t_cb_size * Rt / * Wt).
+    TT_FATAL(
+        w_rot_tiles % w_rot_block == 0 && lat_tiles % (Sk_chunk_t_cb_size * Rt) == 0 &&
+            cs_tiles % (Sk_chunk_t_cb_size * Wt) == 0,
+        "palu_sdpa_decode: Palu CB sizes must be a whole number of reader push blocks (w_rot_tiles={} "
+        "w_rot_block={}, lat_tiles={} chunk={}, cs_tiles={} chunk={})",
+        w_rot_tiles,
+        w_rot_block,
+        lat_tiles,
+        Sk_chunk_t_cb_size * Rt,
+        cs_tiles,
+        Sk_chunk_t_cb_size * Wt);
     add_cb(CBIndex::c_9, lat_tiles * lat_tile_size, lat_df, lat_tile_size, &full_tile);
     add_cb(CBIndex::c_4, w_rot_tiles * w_tile_size, w_df, w_tile_size, &full_tile);
     add_cb(CBIndex::c_10, ab_tiles * bf16_tile_size, tt::DataFormat::Float16_b, bf16_tile_size, &full_tile);

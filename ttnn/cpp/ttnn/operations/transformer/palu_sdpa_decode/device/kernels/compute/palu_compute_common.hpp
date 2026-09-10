@@ -78,6 +78,12 @@ ALWI void palu_build_k_chunk(uint32_t Sk_chunk_t, uint32_t cs_tile_base) {
 // ---------------- Phase 2: the query state (spec §5) ----------------
 // cb_q holds the rotated query as ONE block of 2n tiles (n = PNHt*DHt), fp32:
 //     [ q~ | q~ T ]        with q~ = q R_{-k c} after k steps.
+// "fp32" here is the CB's tile format, not the multiply's actual precision: Wormhole's FPU unpacks
+// fp32 operands into 19-bit Src registers (~11 mantissa bits per multiply, i.e. close to bf16), so
+// each palu_step_q update carries noticeably less than full fp32 precision. The state is still kept
+// in fp32 tiles because that is what avoids compounding rounding error additively across steps
+// (16 steps at 8k drift by well under a bf16 ulp per spec §5); it does not buy full fp32 accuracy
+// per step.
 // Keeping q~ T alongside q~ turns the per-chunk rotation into a plain complex multiply -- no matmul
 // per step -- because T is the pair rotation (T^2 = -I) and cos/sin are constant across a pair:
 //     q~'   = q~ cos(c f) - (q~ T) sin(c f)
