@@ -11,6 +11,7 @@
 
 #include "ttnn/operations/transformer/sdpa_decode/device/kernels/rt_args_common.hpp"
 #include "ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/dataflow_common.hpp"
+#include "palu_dataflow_common.hpp"
 
 void kernel_main() {
     Noc noc;
@@ -61,14 +62,25 @@ void kernel_main() {
     // before page_table lookup. Value is in TILE rows (= cache_position_modulo /
     // TILE_HEIGHT). Validated to be a multiple of block_size_t at op level.
     constexpr uint32_t capacity_t = get_compile_time_arg_val(36);
+    // ---------------- Palu (stage 2) ----------------
+    constexpr uint32_t Rt = get_compile_time_arg_val(37);       // latent width in tiles
+    constexpr bool phase2 = get_compile_time_arg_val(38) == 1;  // chunk-relative rotation (Task 4)
+    constexpr uint32_t Wt = 2 * DHt;
 
-    constexpr auto q_args = TensorAccessorArgs<37>();
+    constexpr auto q_args = TensorAccessorArgs<39>();
     constexpr auto k_args = TensorAccessorArgs<q_args.next_compile_time_args_offset()>();
     constexpr auto v_args = TensorAccessorArgs<k_args.next_compile_time_args_offset()>();
     constexpr auto mask_args = TensorAccessorArgs<v_args.next_compile_time_args_offset()>();
     constexpr auto pos_args = TensorAccessorArgs<mask_args.next_compile_time_args_offset()>();
     constexpr auto page_table_args = TensorAccessorArgs<pos_args.next_compile_time_args_offset()>();
     constexpr auto attention_sink_args = TensorAccessorArgs<page_table_args.next_compile_time_args_offset()>();
+    constexpr auto w_rot_args = TensorAccessorArgs<attention_sink_args.next_compile_time_args_offset()>();
+    constexpr auto cs_args = TensorAccessorArgs<w_rot_args.next_compile_time_args_offset()>();
+    constexpr auto rot_step_args = TensorAccessorArgs<cs_args.next_compile_time_args_offset()>();
+    constexpr auto trans_mat_args = TensorAccessorArgs<rot_step_args.next_compile_time_args_offset()>();
+    // rot_step_args / trans_mat_args are consumed in Task 4 (Phase 2); referenced here so the
+    // accessor-arg chain stays checked and the unused-variable warning stays out of the build log.
+    static_assert(trans_mat_args.next_compile_time_args_offset() > 0);
 
     constexpr uint32_t cb_q_in = tt::CBIndex::c_0;
     constexpr uint32_t cb_k_in = tt::CBIndex::c_1;
@@ -82,6 +94,10 @@ void kernel_main() {
     constexpr uint32_t cb_id_page_table = tt::CBIndex::c_9;
     constexpr uint32_t cb_q_rm = tt::CBIndex::c_10;
     constexpr uint32_t cb_compute_cur_pos = tt::CBIndex::c_15;
+    // Palu CBs (spec §4); the stock owners of these slots are compiled out in the envelope.
+    constexpr uint32_t cb_lat_in = tt::CBIndex::c_9;
+    constexpr uint32_t cb_w_rot = tt::CBIndex::c_4;
+    constexpr uint32_t cb_cs_in = tt::CBIndex::c_13;
 
     uint32_t arg_idx = 0;
     const uint32_t q_addr = get_arg_val<uint32_t>(arg_idx++);
@@ -91,6 +107,10 @@ void kernel_main() {
     const uint32_t page_table_addr = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t mask_addr = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t attention_sink_addr = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t w_rot_addr = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t cs_addr = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t rot_step_addr = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t trans_mat_addr = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t page_table_page_size = get_arg_val<uint32_t>(arg_idx++);
     const bool is_worker = get_arg_val<uint32_t>(arg_idx++) == 0;
     const bool is_output_core = get_arg_val<uint32_t>(arg_idx++) == 1;
@@ -225,6 +245,9 @@ void kernel_main() {
 
     const auto mask_reader = TensorAccessor(mask_args, mask_addr);
 
+    const auto w_rot_reader = TensorAccessor(w_rot_args, w_rot_addr);
+    const auto cs_reader = TensorAccessor(cs_args, cs_addr);
+
     // Read attention sink
     if constexpr (use_attention_sink) {
         const auto attention_sink_reader = TensorAccessor(attention_sink_args, attention_sink_addr);
@@ -344,46 +367,17 @@ void kernel_main() {
                     k_tile_bytes);
             }
         } else {
-            // Offset for current batch
-            const uint32_t k_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * St * DHt;
-            const uint32_t k_head_offset = cur_head * St * DHt;
-
-            // Then, read K, V, Mask k_chunk_tiles at a time
-            const uint32_t k_chunk_offset = k_chunk_start * Sk_chunk_t_dynamic * DHt;
-            uint32_t k_start_tile_id = k_batch_offset + k_head_offset + k_chunk_offset;
-
-            // V has its own layout when it's an independent tensor (width = vDHt, not DHt)
+            // ---------------- Palu: latent chunks + rotation tables instead of K chunks ----------------
+            const uint32_t lat_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * St * Rt;
+            const uint32_t lat_head_offset = cur_head * St * Rt;
+            const uint32_t lat_start_tile_id = lat_batch_offset + lat_head_offset + k_chunk_start * Sk_chunk_t_dynamic * Rt;
             const uint32_t v_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * St * vDHt;
             const uint32_t v_head_offset = cur_head * St * vDHt;
-            const uint32_t v_chunk_offset = k_chunk_start * Sk_chunk_t_dynamic * vDHt;
-            uint32_t v_start_tile_id = v_batch_offset + v_head_offset + v_chunk_offset;
-
-            read_kv_mask_chunks<
-                DHt,
-                vDHt,
-                barrier_threshold,
-                mask_tile_bytes,
-                PNHt,
-                use_attention_mask,
-                cb_k_in,
-                cb_v_in,
-                cb_mask_in,
-                reuse_k>(
-                k_chunk_start,
-                k_chunk_end,
-                k_start_tile_id,
-                v_start_tile_id,
-                mask_start_tile_id,
-                Sk_chunk_t_dynamic,
-                k_chunk_tiles,
-                v_chunk_tiles,
-                mask_chunk_tiles,
-                k_reader,
-                v_reader,
-                mask_reader,
-                k_tile_bytes,
-                v_tile_bytes,
-                PSt);
+            const uint32_t v_start_tile_id = v_batch_offset + v_head_offset + k_chunk_start * Sk_chunk_t_dynamic * vDHt;
+            read_w_rot<cb_w_rot, Rt, Wt, barrier_threshold>(cur_head, w_rot_reader);
+            read_palu_chunks<Rt, vDHt, Wt, barrier_threshold, cb_lat_in, cb_v_in, cb_cs_in, phase2>(
+                k_chunk_start, k_chunk_end, lat_start_tile_id, v_start_tile_id, Sk_chunk_t_dynamic,
+                k_reader, v_reader, cs_reader);
         }
     }
 }

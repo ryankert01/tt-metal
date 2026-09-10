@@ -40,6 +40,8 @@ struct PaluSdpaDecodeParams {
     // the effective block_size and ≥ sliding_window_size when both are set. Paged-mode
     // only (validated in validate_on_program_cache_miss).
     std::optional<uint32_t> cache_position_modulo = std::nullopt;
+    // Palu: chunk-relative rotation with the query advanced on core (Phase 2). Set iff rot_step is given.
+    bool cs_recurrence = false;
 };
 
 struct PaluSdpaDecodeInputs {
@@ -55,6 +57,12 @@ struct PaluSdpaDecodeInputs {
     std::optional<Tensor> page_table_tensor;
     std::optional<Tensor> attn_mask;
     std::optional<Tensor> attention_sink;
+
+    // Palu fused-K inputs (spec §3)
+    Tensor w_rot;                      // [1, n_kv, r_k, 2*hd] bf16: [u_k | u_k T]
+    Tensor cs_tab;                     // [1, 1, S_cs >= S, 2*hd] bf16: [cos | sin] per position
+    std::optional<Tensor> rot_step;    // [1, 1, 32, 2*hd] fp32: [cos(c f) | sin(c f)] (Phase 2)
+    std::optional<Tensor> trans_mat;   // [1, 1, 32, 32] bf16 pair-rotation tile (Phase 2)
 };
 
 }  // namespace ttnn::prim

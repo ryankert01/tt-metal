@@ -67,11 +67,13 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
                 v_shape[3],
                 operation_attributes.head_dim_v.value());
         }
+        // Palu: K in DRAM is the latent [B, nkv, S, r_k]; the head dim comes from Q, not from K.
+        // Checked on the logical width: a 48-wide latent is tile-padded to 64 and would slip through.
+        const auto r_k_logical = input_tensors.at(1).logical_shape()[-1];
         TT_FATAL(
-            q_shape[3] == k_shape[3],
-            "Head dimension of Q must be equal to head dim of K, got {} and {}",
-            q_shape[3],
-            k_shape[3]);
+            (r_k_logical == 32 || r_k_logical == 64 || r_k_logical == 96) && k_shape[-1] == r_k_logical,
+            "palu_sdpa_decode: r_k (latent width) must be 32, 64 or 96, got {}",
+            r_k_logical);
         TT_FATAL(
             operation_attributes.head_dim_v.value() <= q_shape[3],
             "Head dimension of V must be less than or equal to head dim of Q, got {} and {}",
@@ -384,11 +386,17 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
 
         // Check hidden size
         const auto D = q_shape[-1];
+        // Palu: K in DRAM is the latent [B, nkv, S, r_k]; the head dim comes from Q.
+        TT_FATAL(D == 128, "palu_sdpa_decode: head_dim must be 128, got {}", D);
         TT_FATAL(
-            k_shape[-1] == D,
-            "K tensor hidden dimension ({}) must equal Q tensor hidden dimension ({})",
-            k_shape[-1],
-            D);
+            k_shape[-1] == 32 || k_shape[-1] == 64 || k_shape[-1] == 96,
+            "palu_sdpa_decode: r_k (latent width) must be 32, 64 or 96, got {}",
+            k_shape[-1]);
+        TT_FATAL(
+            input_tensors.at(1).logical_shape()[-1] == k_shape[-1],
+            "palu_sdpa_decode: r_k (latent width) must not be tile-padded, got logical {} padded {}",
+            input_tensors.at(1).logical_shape()[-1],
+            k_shape[-1]);
 
         if (!use_mla) {
             TT_FATAL(
@@ -450,6 +458,44 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
             "Attention sink must be in DRAM memory, but got {}",
             attention_sink.memory_config().buffer_type());
     }
+
+    // ---------------- Palu envelope (stage 2 spec §3) ----------------
+    TT_FATAL(operation_attributes.is_causal && !operation_attributes.paged_attention, "palu_sdpa_decode: causal, unpaged only");
+    TT_FATAL(tensor_args.cur_pos_tensor.has_value(), "palu_sdpa_decode: cur_pos_tensor is required");
+    TT_FATAL(
+        !tensor_args.attn_mask.has_value() && !tensor_args.attention_sink.has_value() &&
+            !tensor_args.page_table_tensor.has_value() && !operation_attributes.sliding_window_size.has_value() &&
+            !operation_attributes.share_cache.value_or(false),
+        "palu_sdpa_decode: mask, sink, page table, sliding window and share_cache are outside the envelope");
+    TT_FATAL(tensor_args.q.layout() == Layout::TILE, "palu_sdpa_decode: Q must be TILE layout (c_10 is reused)");
+    TT_FATAL(q_shape[1] <= 32, "palu_sdpa_decode: batch must be <= 32, got {}", q_shape[1]);
+    const uint32_t r_k = k_shape[-1];
+    const uint32_t n_kv = k_shape[1];
+    const uint32_t S = k_shape[2];
+    const uint32_t D_palu = q_shape[-1];
+    auto expect = [](const Tensor& t, const char* name, std::initializer_list<uint32_t> shape, DataType dt) {
+        TT_FATAL(t.storage_type() == StorageType::DEVICE && t.buffer() != nullptr, "palu_sdpa_decode: {} must be on device", name);
+        TT_FATAL(t.layout() == Layout::TILE, "palu_sdpa_decode: {} must be TILE layout", name);
+        TT_FATAL(t.dtype() == dt, "palu_sdpa_decode: {} has the wrong dtype", name);
+        TT_FATAL(t.padded_shape().rank() == 4, "palu_sdpa_decode: {} must be rank 4", name);
+        uint32_t i = 0;
+        for (uint32_t want : shape) {
+            TT_FATAL(want == 0 || t.padded_shape()[i] == want, "palu_sdpa_decode: {} dim {} is {}, expected {}", name, i, t.padded_shape()[i], want);
+            i++;
+        }
+    };
+    expect(tensor_args.w_rot, "w_rot", {1, n_kv, r_k, 2 * D_palu}, DataType::BFLOAT16);
+    expect(tensor_args.cs_tab, "cs_tab", {1, 1, 0, 2 * D_palu}, DataType::BFLOAT16);
+    TT_FATAL(tensor_args.cs_tab.padded_shape()[2] >= S, "palu_sdpa_decode: cs_tab has {} rows, cache has {}", tensor_args.cs_tab.padded_shape()[2], S);
+    if (operation_attributes.cs_recurrence) {
+        TT_FATAL(tensor_args.trans_mat.has_value(), "palu_sdpa_decode: rot_step needs trans_mat");
+        expect(*tensor_args.rot_step, "rot_step", {1, 1, 32, 2 * D_palu}, DataType::FLOAT32);
+        expect(*tensor_args.trans_mat, "trans_mat", {1, 1, 32, 32}, DataType::BFLOAT16);
+        auto [fid, approx, fp32_dest, l1_acc, full_sync] =
+            get_compute_kernel_config_args(tensor_args.q.device()->arch(), operation_attributes.compute_kernel_config);
+        TT_FATAL(fp32_dest, "palu_sdpa_decode: Phase 2 (rot_step) requires fp32_dest_acc_en");
+        TT_FATAL(false, "palu_sdpa_decode: Phase 2 not implemented yet (Task 4)");
+    }
 }
 
 tt::tt_metal::TensorSpec PaluSdpaDecodeDeviceOperation::compute_output_specs(
@@ -508,55 +554,51 @@ Tensor PaluSdpaDecodeDeviceOperation::create_output_tensors(
 
 Tensor palu_sdpa_decode(
     const Tensor& input_tensor_q,
-    const Tensor& input_tensor_k,
-    const std::optional<const Tensor>& input_tensor_v,
-    const std::optional<const Tensor>& cur_pos_tensor,
-    const std::optional<const Tensor>& page_table_tensor,
-    const std::optional<const Tensor>& attn_mask,
-    const std::optional<const Tensor>& attention_sink,
-    bool is_causal,
-    bool paged_attention,
-    const std::vector<uint32_t>& cur_pos,
+    const Tensor& k_latent,
+    const Tensor& w_rot,
+    const Tensor& cs_tab,
+    const Tensor& v_latent,
+    const Tensor& cur_pos_tensor,
+    const std::optional<const Tensor>& rot_step,
+    const std::optional<const Tensor>& trans_mat,
+    uint32_t head_dim_v,
     std::optional<float> scale,
-    std::optional<uint32_t> sliding_window_size,
     const tt::tt_metal::MemoryConfig& output_mem_config,
     const std::optional<ttnn::operations::transformer::SDPAProgramConfig>& program_config,
     ttnn::DeviceComputeKernelConfig compute_kernel_config,
-    uint32_t k_chunk_size,
-    std::optional<bool> share_cache,
-    std::optional<bool> use_mla,
-    std::optional<uint32_t> head_dim_v,
-    std::optional<ttnn::operations::transformer::PagedCacheGeometryOverride> paged_cache_geometry,
-    std::optional<uint32_t> cache_position_modulo) {
+    uint32_t k_chunk_size) {
     using OperationType = PaluSdpaDecodeDeviceOperation;
+    // Stock attributes pinned to the envelope: causal, unpaged, MLA-style separate V, cur_pos from tensor.
     auto operation_attributes = OperationType::operation_attributes_t{
-        .is_causal = is_causal,
-        .paged_attention = paged_attention,
-        .cur_pos = cur_pos,
+        .is_causal = true,
+        .paged_attention = false,
+        .cur_pos = {},
         .scale = scale,
-        .sliding_window_size = sliding_window_size,
+        .sliding_window_size = std::nullopt,
         .output_mem_config = output_mem_config,
         .program_config = program_config,
         .compute_kernel_config = compute_kernel_config,
         .k_chunk_size = k_chunk_size,
-        .share_cache = share_cache,
-        .use_mla = use_mla,
+        .share_cache = std::nullopt,
+        .use_mla = true,
         .head_dim_v = head_dim_v,
-        .paged_cache_geometry =
-            paged_cache_geometry.value_or(ttnn::operations::transformer::PagedCacheGeometryOverride{}),
-        .cache_position_modulo = cache_position_modulo,
+        .paged_cache_geometry = ttnn::operations::transformer::PagedCacheGeometryOverride{},
+        .cache_position_modulo = std::nullopt,
+        .cs_recurrence = rot_step.has_value(),
     };
-
     auto tensor_args = OperationType::tensor_args_t{
         .q = input_tensor_q,
-        .k = input_tensor_k,
-        .v = input_tensor_v,
+        .k = k_latent,
+        .v = v_latent,
         .cur_pos_tensor = cur_pos_tensor,
-        .page_table_tensor = page_table_tensor,
-        .attn_mask = attn_mask,
-        .attention_sink = attention_sink,
+        .page_table_tensor = std::nullopt,
+        .attn_mask = std::nullopt,
+        .attention_sink = std::nullopt,
+        .w_rot = w_rot,
+        .cs_tab = cs_tab,
+        .rot_step = rot_step,
+        .trans_mat = trans_mat,
     };
-
     return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }
 

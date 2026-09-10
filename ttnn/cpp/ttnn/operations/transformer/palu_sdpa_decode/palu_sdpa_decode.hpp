@@ -10,18 +10,19 @@
 
 namespace ttnn::transformer {
 
+// Palu fused-K flash decode (stage 2). K is never materialised: each K chunk is rebuilt on core
+// from the latent cache as RoPE(lat @ u_k). See docs/superpowers/specs/2026-09-10-palu-tt-stage2-design.md.
 ttnn::Tensor palu_sdpa_decode(
-    const ttnn::Tensor& input_tensor_q,
-    const ttnn::Tensor& input_tensor_k,
-    const std::optional<const Tensor>& input_tensor_v,
+    const ttnn::Tensor& input_tensor_q,          // [1, B, nh, 128] bf16 TILE, already rotated
+    const ttnn::Tensor& k_latent,                // [B, nkv, S, r_k]   (r_k in {32, 64, 96})
+    const ttnn::Tensor& w_rot,                   // [1, nkv, r_k, 256] bf16: [u_k | u_k T]
+    const ttnn::Tensor& cs_tab,                  // [1, 1, >=S, 256] bf16: [cos | sin]
+    const ttnn::Tensor& v_latent,                // [B, nkv, S, r_v]
     uint32_t head_dim_v,
-    bool is_causal = true,
-    const std::optional<const Tensor>& attn_mask = std::nullopt,
-    const std::vector<uint32_t>& cur_pos = std::vector<uint32_t>(),
-    const std::optional<const Tensor>& cur_pos_tensor = std::nullopt,
-    const std::optional<const Tensor>& attention_sink = std::nullopt,
+    const ttnn::Tensor& cur_pos_tensor,          // [B] int32
+    const std::optional<const Tensor>& rot_step = std::nullopt,   // [1, 1, 32, 256] fp32 -> Phase 2
+    const std::optional<const Tensor>& trans_mat = std::nullopt,  // [1, 1, 32, 32] bf16 (Phase 2)
     std::optional<float> scale = std::nullopt,
-    std::optional<uint32_t> sliding_window_size = std::nullopt,
     const std::optional<MemoryConfig>& memory_config = std::nullopt,
     std::optional<operations::transformer::SDPAProgramConfig> program_config = std::nullopt,
     std::optional<DeviceComputeKernelConfig> compute_kernel_config = std::nullopt);

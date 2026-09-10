@@ -38,23 +38,22 @@ namespace ttnn::transformer {
 
 ttnn::Tensor palu_sdpa_decode(
     const ttnn::Tensor& input_tensor_q,
-    const ttnn::Tensor& input_tensor_k,
-    const std::optional<const Tensor>& input_tensor_v,
+    const ttnn::Tensor& k_latent,
+    const ttnn::Tensor& w_rot,
+    const ttnn::Tensor& cs_tab,
+    const ttnn::Tensor& v_latent,
     const uint32_t head_dim_v,
-    const bool is_causal,
-    const std::optional<const Tensor>& attn_mask,
-    const std::vector<uint32_t>& cur_pos,
-    const std::optional<const Tensor>& cur_pos_tensor,
-    const std::optional<const Tensor>& attention_sink,
+    const ttnn::Tensor& cur_pos_tensor,
+    const std::optional<const Tensor>& rot_step,
+    const std::optional<const Tensor>& trans_mat,
     std::optional<float> scale,
-    std::optional<uint32_t> sliding_window_size,
     const std::optional<MemoryConfig>& memory_config,
     std::optional<ttnn::operations::transformer::SDPAProgramConfig> program_config,
     std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
     [[maybe_unused]] auto arch = input_tensor_q.storage_type() == StorageType::DEVICE
                                      ? input_tensor_q.device()->arch()
                                      : ttnn::GetDefaultDevice()->arch();
-    uint32_t s = input_tensor_k.logical_shape()[-2];
+    uint32_t s = k_latent.logical_shape()[-2];
     uint32_t k_chunk_size = palu_get_chunk_size(s);
     if (program_config.has_value() && program_config.value().k_chunk_size > 0) {
         k_chunk_size = program_config.value().k_chunk_size;
@@ -71,37 +70,18 @@ ttnn::Tensor palu_sdpa_decode(
             k_chunk_size);
     }
 
-    if (input_tensor_v.has_value()) {
-        TT_FATAL(
-            input_tensor_v.value().padded_shape()[-1] == head_dim_v,
-            "Head dimension of the V tensor must be equal to head_dim_v parameter value, got {} and {}",
-            input_tensor_v.value().padded_shape()[-1],
-            head_dim_v);
-    }
+    TT_FATAL(
+        v_latent.padded_shape()[-1] == head_dim_v,
+        "Head dimension of the V tensor must be equal to head_dim_v parameter value, got {} and {}",
+        v_latent.padded_shape()[-1],
+        head_dim_v);
     // get chunk size and then pass to sdpa decode as an attribute for prgm cache
     auto kernel_config_val = init_device_compute_kernel_config(
         input_tensor_q.device()->arch(), compute_kernel_config, tt::tt_metal::MathFidelity::HiFi2, true, false, false);
 
     return ttnn::prim::palu_sdpa_decode(
-        input_tensor_q,
-        input_tensor_k,
-        input_tensor_v,
-        cur_pos_tensor,
-        std::nullopt,
-        attn_mask,
-        attention_sink,
-        is_causal,
-        false,
-        cur_pos,
-        scale,
-        sliding_window_size,
-        memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG),
-        program_config,
-        kernel_config_val,
-        k_chunk_size,
-        std::nullopt,
-        true,
-        head_dim_v);
+        input_tensor_q, k_latent, w_rot, cs_tab, v_latent, cur_pos_tensor, rot_step, trans_mat, head_dim_v, scale,
+        memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG), program_config, kernel_config_val, k_chunk_size);
 }
 
 }  // namespace ttnn::transformer

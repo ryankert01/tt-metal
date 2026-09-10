@@ -37,6 +37,13 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     const auto& page_table_tensor = tensor_args.page_table_tensor;
     const auto& attn_mask = tensor_args.attn_mask;
     const auto& attention_sink = tensor_args.attention_sink;
+
+    // ---------------- Palu inputs (stage 2) ----------------
+    const auto& w_rot = tensor_args.w_rot;
+    const auto& cs_tab = tensor_args.cs_tab;
+    const bool phase2 = operation_attributes.cs_recurrence;  // rot_step + trans_mat present (Task 4)
+    Buffer* rot_step_buffer = phase2 ? tensor_args.rot_step->buffer() : nullptr;
+    Buffer* trans_mat_buffer = phase2 ? tensor_args.trans_mat->buffer() : nullptr;
     const auto& output_tensor = tensor_return_value;
 
     // ========== Operation Attributes ==========
@@ -94,7 +101,7 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     uint32_t B = q_shape[1];
     uint32_t PNH = q_shape[2];
     uint32_t S = k_shape[2];
-    uint32_t DH = apply_geometry_override ? q_shape[3] : k_shape[3];
+    uint32_t DH = q_shape[3];  // Palu: k_shape[3] is the latent width r_k, the head dim comes from Q
     uint32_t vDH = use_mla ? head_dim_v : (apply_geometry_override ? q_shape[3] : v_shape[3]);
     uint32_t Bkv = k_shape[0];
     const uint32_t Bmask = attn_mask.has_value() ? attn_mask->padded_shape()[0] : Bkv;
@@ -161,6 +168,9 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     const uint32_t vDHt = vDH / TILE_WIDTH;
     const uint32_t PNHt = PNH / q_heads_parallel_factor / TILE_HEIGHT;
     const uint32_t Sk_chunk_t = k_chunk_size / TILE_HEIGHT;
+    const uint32_t r_k = k_shape[3];
+    const uint32_t Rt = r_k / TILE_WIDTH;   // latent width in tiles
+    const uint32_t Wt = 2 * DHt;            // [u_k | u_k T] / [cos | sin] width in tiles
 
     // ========== Grid & Core Configuration ==========
     CoreCoord grid_size = program_config.has_value() ? program_config->compute_with_storage_grid_size
@@ -430,6 +440,10 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     const tt::DataFormat q_df = tt_metal::datatype_to_dataformat_converter(input_tensor_q.dtype());
     const tt::DataFormat k_df = tt_metal::datatype_to_dataformat_converter(input_tensor_k.dtype());
     const tt::DataFormat v_df = tt_metal::datatype_to_dataformat_converter(input_tensor_v.dtype());
+    const tt::DataFormat lat_df = k_df;                        // the latent cache dtype (bfp8 by default)
+    const tt::DataFormat krot_df = tt::DataFormat::Float16_b;  // K_rot is built on core in bf16
+    const tt::DataFormat w_df = tt_metal::datatype_to_dataformat_converter(w_rot.dtype());
+    const tt::DataFormat cs_df = tt_metal::datatype_to_dataformat_converter(cs_tab.dtype());
     const tt::DataFormat out_df = tt_metal::datatype_to_dataformat_converter(output_tensor.dtype());
     const tt::DataFormat mask_df = use_attention_mask
                                        ? tt_metal::datatype_to_dataformat_converter(attn_mask.value().dtype())
@@ -442,7 +456,9 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     // ========== Tile Configurations ==========
     const auto half_tile = tt::tt_metal::Tile({16, 32});
     const auto full_tile = tt::tt_metal::Tile({32, 32});
-    const bool use_half_tile = is_causal && num_q_heads <= 16 && q_df == tt::DataFormat::Float16_b;
+    // Palu: Phase 2 keeps the rotated query in a full-tile fp32 CB that feeds the QK matmul, and every
+    // Q-side intermediate must share that geometry, so the 16-row Q tile optimisation is off here.
+    const bool use_half_tile = false;
     const auto q_tile = use_half_tile ? half_tile : full_tile;
     const auto k_tile = full_tile;
     const auto v_tile = full_tile;
@@ -452,7 +468,11 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     const auto im_tile = use_half_tile ? half_tile : full_tile;
     const auto stats_tile = use_half_tile ? half_tile : full_tile;
     const uint32_t q_tile_size = q_tile.get_tile_size(q_df);
-    const uint32_t k_tile_size = k_tile.get_tile_size(k_df);
+    const uint32_t k_tile_size = k_tile.get_tile_size(krot_df);
+    const uint32_t lat_tile_size = full_tile.get_tile_size(lat_df);
+    const uint32_t w_tile_size = full_tile.get_tile_size(w_df);
+    const uint32_t cs_tile_size = full_tile.get_tile_size(cs_df);
+    const uint32_t bf16_tile_size = full_tile.get_tile_size(tt::DataFormat::Float16_b);
     const uint32_t v_tile_size = v_tile.get_tile_size(v_df);
     const uint32_t mask_tile_size = mask_tile.get_tile_size(mask_df);
     const uint32_t out_tile_size = out_tile.get_tile_size(out_df);
@@ -538,7 +558,7 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
 
     // Input CBs
     add_cb(CBIndex::c_0, q_tiles * q_tile_size, q_df, q_tile_size, &q_tile, q_locally_available ? q_buffer : nullptr);
-    add_cb(CBIndex::c_1, k_tiles * k_tile_size, k_df, k_tile_size);                        // K input
+    add_cb(CBIndex::c_1, k_tiles * k_tile_size, krot_df, k_tile_size);  // K_rot, built on core
     add_cb(CBIndex::c_2, v_tiles * v_tile_size, v_df, v_tile_size);                        // V input
     add_cb(CBIndex::c_3, qk_tiles * mask_tile_size, mask_df, mask_tile_size, &mask_tile);  // attn_mask
     if (use_attention_sink) {
@@ -575,7 +595,21 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
             nullptr,
             is_page_table_sharded ? page_table_buffer : nullptr);
     }
-    add_cb(CBIndex::c_10, q_tiles * q_tile_size, q_df, q_tile_size, &q_tile);  // tilized Q
+    // ---------------- Palu CBs (spec §4) ----------------
+    // The stock owners of these slots (row-major Q c_10, sink c_4, page table c_9, sliding window c_13,
+    // block padding c_14) are outside the envelope and are never allocated here.
+    const uint32_t lat_tiles = Sk_chunk_t_cb_size * Rt * 2;                                  // latent chunk, double buffered
+    // Exactly one head's [u_k | u_k T]. The reader writes a push of Rt*Wt tiles linearly from the CB
+    // write pointer, so the CB size must stay a multiple of that granule -- a core that owns several
+    // KV heads pushes here once per head and the pointer must land back at the CB base. (Task 4's
+    // T tile therefore needs its own slot, not a +1 here.)
+    const uint32_t w_rot_tiles = Rt * Wt;
+    const uint32_t ab_tiles = 2 * Wt;                                                         // one AB row block, ping-pong
+    const uint32_t cs_tiles = phase2 ? Sk_chunk_t_cb_size * Wt : 2 * Sk_chunk_t_cb_size * Wt;  // resident table / streamed x2
+    add_cb(CBIndex::c_9, lat_tiles * lat_tile_size, lat_df, lat_tile_size, &full_tile);
+    add_cb(CBIndex::c_4, w_rot_tiles * w_tile_size, w_df, w_tile_size, &full_tile);
+    add_cb(CBIndex::c_10, ab_tiles * bf16_tile_size, tt::DataFormat::Float16_b, bf16_tile_size, &full_tile);
+    add_cb(CBIndex::c_13, cs_tiles * cs_tile_size, cs_df, cs_tile_size, &full_tile);
 
     // Scalar/identity CBs
     const uint32_t col_identity_tile_size = full_tile.get_tile_size(scalar_df);
@@ -682,6 +716,8 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
         static_cast<uint32_t>(use_col_major_group_indexing),  // use_k_mcast
         Bmask,
         capacity_t,
+        Rt,
+        static_cast<uint32_t>(phase2),
     };
     tt_metal::TensorAccessorArgs(input_tensor_q.buffer()).append_to(reader_compile_time_args_common);
     tt_metal::TensorAccessorArgs(input_tensor_k.buffer()).append_to(reader_compile_time_args_common);
@@ -696,6 +732,10 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     } else {
         tt_metal::TensorAccessorArgs(static_cast<const Buffer*>(nullptr)).append_to(reader_compile_time_args_common);
     }
+    tt_metal::TensorAccessorArgs(w_rot.buffer()).append_to(reader_compile_time_args_common);
+    tt_metal::TensorAccessorArgs(cs_tab.buffer()).append_to(reader_compile_time_args_common);
+    tt_metal::TensorAccessorArgs(rot_step_buffer).append_to(reader_compile_time_args_common);
+    tt_metal::TensorAccessorArgs(trans_mat_buffer).append_to(reader_compile_time_args_common);
 
     std::vector<uint32_t> writer_compile_time_args_common = {
         B,
@@ -762,6 +802,7 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
         sliding_window_size,
         num_tree_reduction_rounds,
         original_block_size,
+        Rt,
     };
 
     // ========== Compute Defines ==========
@@ -769,6 +810,10 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     compute_defines["EXP_APPROX_MODE"] = std::to_string(exp_approx_mode);
     compute_defines["DHT_GRANULARITY"] = std::to_string(dht_granularity);
     compute_defines["LOG2_DHT_GRANULARITY"] = std::to_string(log2_dht_granularity);
+    compute_defines["PALU_DST_TILES"] = std::to_string(dst_size);
+    if (phase2) {
+        compute_defines["PALU_PHASE2"] = "1";
+    }
 
     if (Sk_chunk_t > 0) {
         auto add_granularity = [&](const char* name, uint32_t value) {
@@ -923,6 +968,10 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
         reader_rt_args.push_back(page_table_buffer);
         reader_rt_args.push_back(attn_mask_buffer);
         reader_rt_args.push_back(attention_sink_buffer);
+        reader_rt_args.push_back(w_rot.buffer());
+        reader_rt_args.push_back(cs_tab.buffer());
+        reader_rt_args.push_back(rot_step_buffer);
+        reader_rt_args.push_back(trans_mat_buffer);
         reader_rt_args.push_back(page_table_stick_size);
         reader_rt_args.push_back(static_cast<uint32_t>(do_reduce));
         reader_rt_args.push_back(static_cast<uint32_t>(do_output));
@@ -1008,7 +1057,8 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
 
             // Reader runtime args
             // Base args (20): includes K-mcast args [do_k_mcast, mcast_x, mcast_y0, mcast_y1, num_dests]
-            KernelDescriptor::CoreRuntimeArgs reader_rt_args(20, 0);
+            // +4 Palu buffers (w_rot, cs_tab, rot_step, trans_mat)
+            KernelDescriptor::CoreRuntimeArgs reader_rt_args(24, 0);
 
             // Writer runtime args - need to match the size with tree reduction params
             // Base args (10) + tree params (6) + children_per_round (PALU_MAX_TREE_REDUCTION_ROUNDS) + group coords

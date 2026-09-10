@@ -26,6 +26,8 @@
 #include "api/compute/pack_untilize.h"
 #include "ttnn/operations/transformer/sdpa_decode/device/kernels/rt_args_common.hpp"
 #include "ttnn/operations/transformer/sdpa/device/kernels/compute/compute_common.hpp"
+#include "api/compute/eltwise_binary_sfpu.h"
+#include "ttnn/operations/transformer/palu_sdpa_decode/device/kernels/compute/palu_compute_common.hpp"
 #include "api/compute/pack_untilize.h"
 constexpr uint32_t MAX_PACK_UNTILIZE_WIDTH = 8;
 #include "ttnn/kernel_lib/tilize_helpers.hpp"
@@ -69,6 +71,9 @@ void kernel_main() {
     constexpr uint32_t sliding_window_size = get_compile_time_arg_val(29);
     constexpr uint32_t num_tree_reduction_rounds = get_compile_time_arg_val(30);
     constexpr uint32_t original_block_size = get_compile_time_arg_val(31);
+    // ---------------- Palu (stage 2) ----------------
+    constexpr uint32_t Rt = get_compile_time_arg_val(32);  // latent width in tiles
+    constexpr uint32_t Wt = 2 * DHt;
     constexpr bool has_block_padding = original_block_size > 0 && original_block_size < 32;
 
     constexpr uint32_t q_chunk_tiles = Sq_chunk_t * DHt;
@@ -108,6 +113,12 @@ void kernel_main() {
     constexpr uint32_t cb_out_m = tt::CBIndex::c_17;
     constexpr uint32_t cb_out_l = tt::CBIndex::c_18;
     constexpr uint32_t cb_out_final = tt::CBIndex::c_20;
+
+    // Palu CBs (spec §4)
+    constexpr uint32_t cb_lat_in = tt::CBIndex::c_9;
+    constexpr uint32_t cb_w_rot = tt::CBIndex::c_4;
+    constexpr uint32_t cb_ab = tt::CBIndex::c_10;
+    constexpr uint32_t cb_cs_in = tt::CBIndex::c_13;
 
     // Runtime arguments
     uint32_t arg_idx = 0;
@@ -342,6 +353,13 @@ void kernel_main() {
 
         // Loop through all K chunks
         for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
+            // ---------------- Palu: rebuild this chunk's K on core into cb_k_in ----------------
+            palu_build_k_chunk<cb_lat_in, cb_w_rot, cb_ab, cb_cs_in, cb_k_in, Rt, DHt, PALU_DST_TILES>(
+                Sk_chunk_t_dynamic, /*cs_tile_base=*/0);
+#ifndef PALU_PHASE2
+            CircularBuffer(cb_cs_in).pop_front(Sk_chunk_t_dynamic * Wt);  // Phase 1: streamed rows, consumed
+#endif
+
             // Reconfig register DF
             reconfig_data_format(cb_k_in, cb_q_in);
             pack_reconfig_data_format(cb_qk_im);
@@ -521,6 +539,7 @@ void kernel_main() {
         }
 
         /* END OF FLASH ATTENTION LOOP */
+        CircularBuffer(cb_w_rot).pop_front(Rt * Wt);  // this head's [u_k | u_k T]
 
         /******************************************************************************
          *                      TREE REDUCTION LOGIC                                  *
