@@ -122,6 +122,9 @@ void kernel_main() {
     static_assert(!tilize_q, "Palu reuses the row-major-Q CB (c_10) for the AB block; Q must arrive tilized");
     static_assert(sliding_window_size == 0, "Palu reuses the sliding-window CB (c_13) for [cos | sin]");
     static_assert(!has_block_padding, "Palu reuses the block-padding CB (c_14) for rot_step");
+#ifdef DYNAMIC_CHUNK_SIZE
+#error "palu_sdpa_decode: c_12 is the Phase-2 query state (the stock zero tile is gone); dynamic chunking's mask fusion would read it"
+#endif
     constexpr uint32_t cb_lat_in = tt::CBIndex::c_9;
     constexpr uint32_t cb_w_rot = tt::CBIndex::c_4;
     constexpr uint32_t cb_ab = tt::CBIndex::c_10;

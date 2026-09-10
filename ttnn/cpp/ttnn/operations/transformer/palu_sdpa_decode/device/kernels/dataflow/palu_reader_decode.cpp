@@ -83,6 +83,8 @@ void kernel_main() {
     // factory refuses to build otherwise, and these assert the kernel side of that contract.
     static_assert(!use_attention_sink, "Palu reuses the attention-sink CB (c_4) for w_rot");
     static_assert(!is_paged_attention, "Palu reuses the page-table CB (c_9) for the latent chunk");
+    static_assert(sliding_window_size == 0, "Palu reuses the sliding-window CB (c_13) for [cos | sin]");
+    static_assert(!has_block_padding, "Palu reuses the block-padding CB (c_14) for rot_step");
 
     constexpr uint32_t cb_q_in = tt::CBIndex::c_0;
     constexpr uint32_t cb_k_in = tt::CBIndex::c_1;
