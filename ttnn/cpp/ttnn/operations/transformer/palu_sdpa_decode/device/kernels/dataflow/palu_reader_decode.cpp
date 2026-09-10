@@ -78,9 +78,11 @@ void kernel_main() {
     constexpr auto cs_args = TensorAccessorArgs<w_rot_args.next_compile_time_args_offset()>();
     constexpr auto rot_step_args = TensorAccessorArgs<cs_args.next_compile_time_args_offset()>();
     constexpr auto trans_mat_args = TensorAccessorArgs<rot_step_args.next_compile_time_args_offset()>();
-    // rot_step_args / trans_mat_args are consumed in Task 4 (Phase 2); referenced here so the
-    // accessor-arg chain stays checked and the unused-variable warning stays out of the build log.
-    static_assert(trans_mat_args.next_compile_time_args_offset() > 0);
+    static_assert(trans_mat_args.next_compile_time_args_offset() > 0);  // keeps the arg chain checked
+    // The Palu CBs below reuse slots whose stock owners must be compiled out (spec §4); the program
+    // factory refuses to build otherwise, and these assert the kernel side of that contract.
+    static_assert(!use_attention_sink, "Palu reuses the attention-sink CB (c_4) for w_rot");
+    static_assert(!is_paged_attention, "Palu reuses the page-table CB (c_9) for the latent chunk");
 
     constexpr uint32_t cb_q_in = tt::CBIndex::c_0;
     constexpr uint32_t cb_k_in = tt::CBIndex::c_1;
@@ -98,6 +100,7 @@ void kernel_main() {
     constexpr uint32_t cb_lat_in = tt::CBIndex::c_9;
     constexpr uint32_t cb_w_rot = tt::CBIndex::c_4;
     constexpr uint32_t cb_cs_in = tt::CBIndex::c_13;
+    constexpr uint32_t cb_rot_step = tt::CBIndex::c_14;
 
     uint32_t arg_idx = 0;
     const uint32_t q_addr = get_arg_val<uint32_t>(arg_idx++);
@@ -247,6 +250,15 @@ void kernel_main() {
 
     const auto w_rot_reader = TensorAccessor(w_rot_args, w_rot_addr);
     const auto cs_reader = TensorAccessor(cs_args, cs_addr);
+    const auto trans_mat_reader = TensorAccessor(trans_mat_args, trans_mat_addr);
+
+    if constexpr (phase2) {
+        // Chunk-relative [cos | sin] rows t = 0..c-1: the first Sk_chunk_t row tiles of cs_tab, and the
+        // per-chunk rotation constants. Both are read once per core and stay resident for the run.
+        palu_read_tiles<cb_cs_in, barrier_threshold>(0, Sk_chunk_t_dynamic * Wt, cs_reader);
+        const auto rot_step_reader = TensorAccessor(rot_step_args, rot_step_addr);
+        palu_read_tiles<cb_rot_step, barrier_threshold>(0, Wt, rot_step_reader);
+    }
 
     // Read attention sink
     if constexpr (use_attention_sink) {
@@ -374,7 +386,7 @@ void kernel_main() {
             const uint32_t v_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * St * vDHt;
             const uint32_t v_head_offset = cur_head * St * vDHt;
             const uint32_t v_start_tile_id = v_batch_offset + v_head_offset + k_chunk_start * Sk_chunk_t_dynamic * vDHt;
-            read_w_rot<cb_w_rot, Rt, Wt, barrier_threshold>(cur_head, w_rot_reader);
+            read_w_rot<cb_w_rot, Rt, Wt, barrier_threshold, phase2>(cur_head, w_rot_reader, trans_mat_reader);
             read_palu_chunks<Rt, vDHt, Wt, barrier_threshold, cb_lat_in, cb_v_in, cb_cs_in, phase2>(
                 k_chunk_start, k_chunk_end, lat_start_tile_id, v_start_tile_id, Sk_chunk_t_dynamic,
                 k_reader, v_reader, cs_reader);

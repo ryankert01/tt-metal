@@ -74,3 +74,88 @@ ALWI void palu_build_k_chunk(uint32_t Sk_chunk_t, uint32_t cs_tile_base) {
     k.push_back(Sk_chunk_t * DHt);
     lat.pop_front(Sk_chunk_t * Rt);
 }
+
+// ---------------- Phase 2: the query state (spec §5) ----------------
+// cb_q holds the rotated query as ONE block of 2n tiles (n = PNHt*DHt), fp32:
+//     [ q~ | q~ T ]        with q~ = q R_{-k c} after k steps.
+// Keeping q~ T alongside q~ turns the per-chunk rotation into a plain complex multiply -- no matmul
+// per step -- because T is the pair rotation (T^2 = -I) and cos/sin are constant across a pair:
+//     q~'   = q~ cos(c f) - (q~ T) sin(c f)
+//     q~' T = (q~ T) cos(c f) + q~ sin(c f)
+// The block is the CB's push/pop granule, and cb_q is sized 4n so that the block being read and the
+// block being written are each contiguous: an operand tile index is an offset from the read pointer
+// and does NOT wrap at the end of the CB.
+
+// state <- [Q | Q T]: copy the (already position-rotated) bf16 Q in, and multiply it by the trans_mat
+// tile that rides at index t_idx of cb_w (T is block-diagonal per 32 columns, so one tile does all of them).
+template <uint32_t cb_q_in, uint32_t cb_q, uint32_t cb_w, uint32_t n, uint32_t w_tiles>
+ALWI void palu_init_q_state(uint32_t t_idx) {
+    CircularBuffer src(cb_q_in), q(cb_q), w(cb_w);
+    src.wait_front(n);
+    w.wait_front(w_tiles);
+    q.reserve_back(2 * n);
+    pack_reconfig_data_format(cb_q);
+    reconfig_data_format_srca(cb_q_in);
+    copy_init(cb_q_in);
+    for (uint32_t i = 0; i < n; ++i) {
+        tile_regs_acquire();
+        copy_tile(cb_q_in, i, 0);
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile<true>(0, cb_q, i);
+        tile_regs_release();
+    }
+    reconfig_data_format(cb_w, cb_q_in);  // matmul: in1 -> SrcA, in0 -> SrcB
+    matmul_init(cb_q_in, cb_w);
+    for (uint32_t i = 0; i < n; ++i) {
+        tile_regs_acquire();
+        matmul_tiles(cb_q_in, cb_w, i, t_idx, 0);
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile<true>(0, cb_q, n + i);
+        tile_regs_release();
+    }
+    q.push_back(2 * n);
+}
+
+// One chunk step: state <- state R_{-c}. cb_step holds 2*DHt fp32 tiles [cos(c f) | sin(c f)] with
+// every row identical, so a plain mul_tiles applies the per-column constant to all 32 rows.
+template <uint32_t cb_q, uint32_t cb_step, uint32_t DHt, uint32_t PNHt>
+ALWI void palu_step_q() {
+    constexpr uint32_t n = PNHt * DHt;
+    CircularBuffer q(cb_q), step(cb_step);
+    q.wait_front(2 * n);
+    step.wait_front(2 * DHt);
+    q.reserve_back(2 * n);
+    reconfig_data_format(cb_q, cb_step);  // eltwise: in0 -> SrcA, in1 -> SrcB
+    pack_reconfig_data_format(cb_q);
+    mul_init(cb_q, cb_step);
+    // q~' = q~ * cos_c - (q~ T) * sin_c
+    sub_binary_tile_init();
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t j = i % DHt;  // column tile: the frequency block this tile carries
+        tile_regs_acquire();
+        mul_tiles(cb_q, cb_step, i, j, 0);
+        mul_tiles(cb_q, cb_step, n + i, DHt + j, 1);
+        sub_binary_tile(0, 1, 0);
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile<true>(0, cb_q, i);
+        tile_regs_release();
+    }
+    // q~' T = (q~ T) * cos_c + q~ * sin_c
+    add_binary_tile_init();
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t j = i % DHt;
+        tile_regs_acquire();
+        mul_tiles(cb_q, cb_step, n + i, j, 0);
+        mul_tiles(cb_q, cb_step, i, DHt + j, 1);
+        add_binary_tile(0, 1, 0);
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile<true>(0, cb_q, n + i);
+        tile_regs_release();
+    }
+    q.push_back(2 * n);
+    q.pop_front(2 * n);
+}

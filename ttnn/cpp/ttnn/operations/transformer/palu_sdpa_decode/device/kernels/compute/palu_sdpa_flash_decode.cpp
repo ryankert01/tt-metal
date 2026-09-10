@@ -114,11 +114,27 @@ void kernel_main() {
     constexpr uint32_t cb_out_l = tt::CBIndex::c_18;
     constexpr uint32_t cb_out_final = tt::CBIndex::c_20;
 
-    // Palu CBs (spec §4)
+    // Palu CBs (spec §4). The stock owners of these slots must be compiled out; the program factory
+    // refuses to build otherwise, and these assert the kernel side of that contract. (cb_zero_in above
+    // still names c_12, but matmul_blocks only reads it when it fuses a mask into the QK matmul, which
+    // needs DYNAMIC_CHUNK_SIZE and never happens here -- the writer no longer produces the zero tile.)
+    static_assert(!use_attention_sink, "Palu reuses the attention-sink CB (c_4) for w_rot");
+    static_assert(!tilize_q, "Palu reuses the row-major-Q CB (c_10) for the AB block; Q must arrive tilized");
+    static_assert(sliding_window_size == 0, "Palu reuses the sliding-window CB (c_13) for [cos | sin]");
+    static_assert(!has_block_padding, "Palu reuses the block-padding CB (c_14) for rot_step");
     constexpr uint32_t cb_lat_in = tt::CBIndex::c_9;
     constexpr uint32_t cb_w_rot = tt::CBIndex::c_4;
     constexpr uint32_t cb_ab = tt::CBIndex::c_10;
     constexpr uint32_t cb_cs_in = tt::CBIndex::c_13;
+    constexpr uint32_t cb_qrot = tt::CBIndex::c_12;      // Phase 2: [q~ | q~ T], fp32
+    constexpr uint32_t cb_rot_step = tt::CBIndex::c_14;  // Phase 2: [cos(c f) | sin(c f)], fp32
+#ifdef PALU_PHASE2
+    constexpr uint32_t cb_q_src = cb_qrot;  // QK reads the on-core rotated query
+    constexpr uint32_t w_rot_cb_tiles = Rt * Wt + 1;  // ... + the trans_mat tile, in the same block
+#else
+    constexpr uint32_t cb_q_src = cb_q_in;
+    constexpr uint32_t w_rot_cb_tiles = Rt * Wt;
+#endif
 
     // Runtime arguments
     uint32_t arg_idx = 0;
@@ -298,6 +314,15 @@ void kernel_main() {
         cb_cur_sum = cb_sum_1;
         cb_prev_sum = cb_sum_2;
 
+#ifdef PALU_PHASE2
+        // q~ = q R_{-k_chunk_start * c}: seed [q | q T] from Q, then one R_{-c} step per chunk this
+        // core skips (cores that own a later slice of the context start at their first chunk).
+        palu_init_q_state<cb_q_in, cb_qrot, cb_w_rot, q_chunk_tiles, w_rot_cb_tiles>(Rt * Wt);
+        for (uint32_t s = 0; s < k_chunk_start; ++s) {
+            palu_step_q<cb_qrot, cb_rot_step, DHt, Sq_chunk_t>();
+        }
+#endif
+
         /******************************************************************************
          *                           FLASH ATTENTION LOOP                             *
          ******************************************************************************/
@@ -353,6 +378,11 @@ void kernel_main() {
 
         // Loop through all K chunks
         for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
+#ifdef PALU_PHASE2
+            if (k_chunk > k_chunk_start) {
+                palu_step_q<cb_qrot, cb_rot_step, DHt, Sq_chunk_t>();  // q~ <- q~ R_{-c}
+            }
+#endif
             // ---------------- Palu: rebuild this chunk's K on core into cb_k_in ----------------
             palu_build_k_chunk<cb_lat_in, cb_w_rot, cb_ab, cb_cs_in, cb_k_in, Rt, DHt, PALU_DST_TILES>(
                 Sk_chunk_t_dynamic, /*cs_tile_base=*/0);
@@ -361,7 +391,7 @@ void kernel_main() {
 #endif
 
             // Reconfig register DF
-            reconfig_data_format(cb_k_in, cb_q_in);
+            reconfig_data_format(cb_k_in, cb_q_src);
             pack_reconfig_data_format(cb_qk_im);
 
             // OPTIMIZATION: Add the attention mask directly on top of DST if chunk sizes are dynamic
@@ -382,7 +412,7 @@ void kernel_main() {
                 }
 
                 matmul_blocks(
-                    cb_q_in,
+                    cb_q_src,
                     cb_k_in,
                     cb_qk_im,
                     Sq_chunk_t,
@@ -539,7 +569,10 @@ void kernel_main() {
         }
 
         /* END OF FLASH ATTENTION LOOP */
-        CircularBuffer(cb_w_rot).pop_front(Rt * Wt);  // this head's [u_k | u_k T]
+        CircularBuffer(cb_w_rot).pop_front(w_rot_cb_tiles);  // this head's [u_k | u_k T] (+ trans_mat)
+#ifdef PALU_PHASE2
+        CircularBuffer(cb_qrot).pop_front(2 * q_chunk_tiles);  // the last [q~ | q~ T]
+#endif
 
         /******************************************************************************
          *                      TREE REDUCTION LOGIC                                  *

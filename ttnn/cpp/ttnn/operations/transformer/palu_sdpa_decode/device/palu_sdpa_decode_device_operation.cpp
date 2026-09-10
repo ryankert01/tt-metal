@@ -386,17 +386,9 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
 
         // Check hidden size
         const auto D = q_shape[-1];
-        // Palu: K in DRAM is the latent [B, nkv, S, r_k]; the head dim comes from Q.
+        // Palu: K in DRAM is the latent [B, nkv, S, r_k]; the head dim comes from Q. The latent width
+        // itself is checked once, in the use_mla block above (on the logical width, which fires first).
         TT_FATAL(D == 128, "palu_sdpa_decode: head_dim must be 128, got {}", D);
-        TT_FATAL(
-            k_shape[-1] == 32 || k_shape[-1] == 64 || k_shape[-1] == 96,
-            "palu_sdpa_decode: r_k (latent width) must be 32, 64 or 96, got {}",
-            k_shape[-1]);
-        TT_FATAL(
-            input_tensors.at(1).logical_shape()[-1] == k_shape[-1],
-            "palu_sdpa_decode: r_k (latent width) must not be tile-padded, got logical {} padded {}",
-            input_tensors.at(1).logical_shape()[-1],
-            k_shape[-1]);
 
         if (!use_mla) {
             TT_FATAL(
@@ -488,13 +480,22 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
     expect(tensor_args.cs_tab, "cs_tab", {1, 1, 0, 2 * D_palu}, DataType::BFLOAT16);
     TT_FATAL(tensor_args.cs_tab.padded_shape()[2] >= S, "palu_sdpa_decode: cs_tab has {} rows, cache has {}", tensor_args.cs_tab.padded_shape()[2], S);
     if (operation_attributes.cs_recurrence) {
-        TT_FATAL(tensor_args.trans_mat.has_value(), "palu_sdpa_decode: rot_step needs trans_mat");
+        TT_FATAL(tensor_args.trans_mat.has_value(), "palu_sdpa_decode: rot_step and trans_mat are optional together");
         expect(*tensor_args.rot_step, "rot_step", {1, 1, 32, 2 * D_palu}, DataType::FLOAT32);
         expect(*tensor_args.trans_mat, "trans_mat", {1, 1, 32, 32}, DataType::BFLOAT16);
         auto [fid, approx, fp32_dest, l1_acc, full_sync] =
             get_compute_kernel_config_args(tensor_args.q.device()->arch(), operation_attributes.compute_kernel_config);
         TT_FATAL(fp32_dest, "palu_sdpa_decode: Phase 2 (rot_step) requires fp32_dest_acc_en");
-        TT_FATAL(false, "palu_sdpa_decode: Phase 2 not implemented yet (Task 4)");
+    } else {
+        TT_FATAL(
+            !tensor_args.trans_mat.has_value(), "palu_sdpa_decode: rot_step and trans_mat are optional together");
+        // Phase 1 streams a [c, 2*D] cos/sin block per chunk; at the op's default chunk that CB alone
+        // is 512 KB and the program does not fit in L1. Fail here instead of in the L1 allocator.
+        TT_FATAL(
+            operation_attributes.k_chunk_size <= 128,
+            "palu_sdpa_decode: Phase 1 (no rot_step) needs k_chunk_size <= 128 (it streams the [cos | sin] "
+            "table per chunk), got {}",
+            operation_attributes.k_chunk_size);
     }
 }
 

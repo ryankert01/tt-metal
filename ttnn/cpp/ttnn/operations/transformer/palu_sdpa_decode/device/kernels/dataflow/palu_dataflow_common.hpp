@@ -7,14 +7,12 @@
 #include "api/dataflow/circular_buffer.h"
 #include "api/core_local_mem.h"
 
-// n consecutive DRAM tiles [first_tile, first_tile + n) -> one push of n tiles into cb_id.
+// n consecutive DRAM tiles [first_tile, first_tile + n) -> the CB write pointer wp, which is advanced
+// and returned. Caller owns the reserve_back/push_back around it (a push must stay one block).
 template <uint32_t cb_id, uint32_t barrier_threshold, typename ReaderT>
-void palu_read_tiles(uint32_t first_tile, uint32_t n, const ReaderT& reader) {
+uint32_t palu_read_tiles_at(uint32_t wp, uint32_t first_tile, uint32_t n, const ReaderT& reader) {
     Noc noc;
-    CircularBuffer cb(cb_id);
     constexpr uint32_t tile_bytes = get_tile_size(cb_id);
-    cb.reserve_back(n);
-    uint32_t wp = cb.get_write_ptr();
     uint32_t barrier_count = 0;
     for (uint32_t i = 0; i < n; ++i) {
         noc.async_read(reader, CoreLocalMem<uint32_t>(wp), tile_bytes, {.page_id = first_tile + i}, {});
@@ -25,13 +23,32 @@ void palu_read_tiles(uint32_t first_tile, uint32_t n, const ReaderT& reader) {
         wp += tile_bytes;
     }
     noc.async_read_barrier();
+    return wp;
+}
+
+// n consecutive DRAM tiles [first_tile, first_tile + n) -> one push of n tiles into cb_id.
+template <uint32_t cb_id, uint32_t barrier_threshold, typename ReaderT>
+void palu_read_tiles(uint32_t first_tile, uint32_t n, const ReaderT& reader) {
+    CircularBuffer cb(cb_id);
+    cb.reserve_back(n);
+    palu_read_tiles_at<cb_id, barrier_threshold>(cb.get_write_ptr(), first_tile, n, reader);
     cb.push_back(n);
 }
 
-// w_rot for one KV head: Rt x Wt tiles, row-major in DRAM ([1, n_kv, r_k, 2*hd] TILE), pushed once per head.
-template <uint32_t cb_w, uint32_t Rt, uint32_t Wt, uint32_t barrier_threshold, typename ReaderT>
-void read_w_rot(uint32_t head, const ReaderT& reader) {
-    palu_read_tiles<cb_w, barrier_threshold>(head * Rt * Wt, Rt * Wt, reader);
+// w_rot for one KV head: Rt x Wt tiles, row-major in DRAM ([1, n_kv, r_k, 2*hd] TILE), and in Phase 2
+// the single trans_mat tile behind them (block index Rt*Wt). ONE push of the whole block per head: a
+// push writes linearly from the write pointer, so the block -- not Rt*Wt -- is the CB's granule.
+template <uint32_t cb_w, uint32_t Rt, uint32_t Wt, uint32_t barrier_threshold, bool phase2, typename ReaderT,
+          typename TReaderT>
+void read_w_rot(uint32_t head, const ReaderT& reader, const TReaderT& trans_mat_reader) {
+    constexpr uint32_t block = Rt * Wt + (phase2 ? 1 : 0);
+    CircularBuffer cb(cb_w);
+    cb.reserve_back(block);
+    uint32_t wp = palu_read_tiles_at<cb_w, barrier_threshold>(cb.get_write_ptr(), head * Rt * Wt, Rt * Wt, reader);
+    if constexpr (phase2) {
+        palu_read_tiles_at<cb_w, barrier_threshold>(wp, 0, 1, trans_mat_reader);
+    }
+    cb.push_back(block);
 }
 
 // Per K chunk, in this order: the latent rows [Sk_chunk_t x Rt] (contiguous in DRAM), the absolute

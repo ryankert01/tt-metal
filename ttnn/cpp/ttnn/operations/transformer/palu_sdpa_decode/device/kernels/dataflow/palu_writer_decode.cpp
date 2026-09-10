@@ -59,7 +59,6 @@ void kernel_main() {
     // owns c_8 alone and can always pop it.
     constexpr uint32_t cb_cur_pos = tt::CBIndex::c_8;
     constexpr uint32_t cb_col_identity = tt::CBIndex::c_11;
-    constexpr uint32_t cb_zero_in = tt::CBIndex::c_12;
     constexpr uint32_t cb_sliding_window_mask_in = tt::CBIndex::c_13;  // Separate buffer for sliding window mask
     constexpr uint32_t cb_block_pad_mask = tt::CBIndex::c_14;          // Block padding mask (block_size < TILE_HEIGHT)
     constexpr uint32_t cb_out_o = tt::CBIndex::c_16;
@@ -211,7 +210,9 @@ void kernel_main() {
         ckernel::PoolType::MAX,
         ckernel::ReduceDim::REDUCE_ROW,
         dataflow_kernel_lib::SUM_AND_MAX_REDUCE_FACTOR>();
-    dataflow_kernel_lib::prepare_zero_tile<cb_zero_in>();
+    // No zero tile (stock: prepare_zero_tile<c_12>): matmul_blocks reads it only when it fuses a mask
+    // into the QK matmul, which needs DYNAMIC_CHUNK_SIZE and never happens in the Palu envelope.
+    // c_12 is the Phase 2 rotated-query state instead (spec §4).
     generate_bcast_col_scalar(CircularBuffer(cb_col_identity), identity_scalar_packed);
 
     // Generate sliding window mask only if we have local data and need it

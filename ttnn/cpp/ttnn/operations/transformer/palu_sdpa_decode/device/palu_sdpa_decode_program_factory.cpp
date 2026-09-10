@@ -91,11 +91,10 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     // ========== Core Dimensions ==========
     // B = batch size, PNH = padded num Q heads, S = sequence length, DH = head dim
     //
-    // With an active PagedCacheGeometryOverride, this call reads a K/V cache allocated
-    // for a different layer's shape; Q's last dim drives DH. Without it, k_shape[3] is used
-    // and the strict q.head_dim == k.head_dim check in validate keeps legacy callers
-    // byte-identical. Overrides are rejected under MLA in validate; do not apply them when
-    // use_mla is true (same asymmetry fix as chunked prefill).
+    // Palu always takes DH from Q: k_shape[3] is the latent width r_k, not a head dim, so the
+    // stock "k_shape[3] unless a PagedCacheGeometryOverride is active" rule does not apply here.
+    // Overrides are rejected under MLA in validate; do not apply them when use_mla is true
+    // (same asymmetry fix as chunked prefill); they still drive vDH and num_kv_heads below.
     const auto& geo = operation_attributes.paged_cache_geometry;
     const bool apply_geometry_override = !use_mla && geo.active();
     uint32_t B = q_shape[1];
@@ -597,24 +596,38 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     }
     // ---------------- Palu CBs (spec §4) ----------------
     // The stock owners of these slots (row-major Q c_10, sink c_4, page table c_9, sliding window c_13,
-    // block padding c_14) are outside the envelope and are never allocated here.
+    // block padding c_14, zero scalar c_12) are outside the envelope and are never allocated here.
+    TT_FATAL(
+        !use_attention_sink && !is_paged_attention && !tilize_q && sliding_window_size == 0 && !has_block_padding,
+        "palu_sdpa_decode: the Palu CBs reuse the sink (c_4), page table (c_9), row-major Q (c_10), zero "
+        "scalar (c_12), sliding window (c_13) and block padding (c_14) slots; none of those stock features "
+        "may be enabled");
     const uint32_t lat_tiles = Sk_chunk_t_cb_size * Rt * 2;                                  // latent chunk, double buffered
-    // Exactly one head's [u_k | u_k T]. The reader writes a push of Rt*Wt tiles linearly from the CB
-    // write pointer, so the CB size must stay a multiple of that granule -- a core that owns several
-    // KV heads pushes here once per head and the pointer must land back at the CB base. (Task 4's
-    // T tile therefore needs its own slot, not a +1 here.)
-    const uint32_t w_rot_tiles = Rt * Wt;
+    // One head's [u_k | u_k T], plus the T tile itself in Phase 2. The reader writes a push linearly
+    // from the CB write pointer, so the CB size must stay a multiple of the push granule -- a core that
+    // owns several KV heads pushes here once per head and the pointer must land back at the CB base.
+    // Hence T rides inside the same single push, and the CB is two whole blocks (prefetch of the next
+    // head), never block + 1.
+    const uint32_t w_rot_block = Rt * Wt + (phase2 ? 1 : 0);
+    const uint32_t w_rot_tiles = 2 * w_rot_block;
     const uint32_t ab_tiles = 2 * Wt;                                                         // one AB row block, ping-pong
     const uint32_t cs_tiles = phase2 ? Sk_chunk_t_cb_size * Wt : 2 * Sk_chunk_t_cb_size * Wt;  // resident table / streamed x2
     add_cb(CBIndex::c_9, lat_tiles * lat_tile_size, lat_df, lat_tile_size, &full_tile);
     add_cb(CBIndex::c_4, w_rot_tiles * w_tile_size, w_df, w_tile_size, &full_tile);
     add_cb(CBIndex::c_10, ab_tiles * bf16_tile_size, tt::DataFormat::Float16_b, bf16_tile_size, &full_tile);
     add_cb(CBIndex::c_13, cs_tiles * cs_tile_size, cs_df, cs_tile_size, &full_tile);
+    if (phase2) {
+        const uint32_t fp32_tile_size = full_tile.get_tile_size(tt::DataFormat::Float32);
+        // rotated-query state, fp32: [q~ | q~ T] pushed and popped as one 2n block (palu_step_q), with
+        // room for the next block -- 4n keeps every block contiguous, so an operand index never wraps.
+        add_cb(CBIndex::c_12, 4 * q_tiles * fp32_tile_size, tt::DataFormat::Float32, fp32_tile_size, &full_tile);
+        // [cos(c f) | sin(c f)] on every row, resident for the run
+        add_cb(CBIndex::c_14, Wt * fp32_tile_size, tt::DataFormat::Float32, fp32_tile_size, &full_tile);
+    }
 
     // Scalar/identity CBs
     const uint32_t col_identity_tile_size = full_tile.get_tile_size(scalar_df);
     add_cb(CBIndex::c_11, scale_tiles * col_identity_tile_size, scalar_df, col_identity_tile_size, &full_tile);
-    add_cb(CBIndex::c_12, scale_tiles * scalar_tile_size, scalar_df, scalar_tile_size, &scalar_tile);
     if (sliding_window_size > 0) {
         add_cb(CBIndex::c_13, qk_tiles * mask_tile_size, mask_df, mask_tile_size, &mask_tile);
     }
