@@ -46,9 +46,21 @@ void kernel_main() {
     constexpr uint32_t sliding_window_size = get_compile_time_arg_val(25);
     constexpr uint32_t num_tree_reduction_rounds = get_compile_time_arg_val(26);
     constexpr uint32_t original_block_size = get_compile_time_arg_val(27);
+    // Tree-reduction receive slots reserved per head in cb_intermed_out. Stage 2c: a core can own
+    // several heads *and* share the sequence split, and the child that feeds this core has no
+    // back-pressure from us -- it writes head h+1's payload as soon as its own writer popped head h's
+    // -- so each head gets its own slots. With one head per core this is the stock
+    // (num_cores_per_head - 1) and the offsets below are byte-for-byte the stage 2b ones.
+    constexpr uint32_t intermed_slots_per_head = get_compile_time_arg_val(28);
     constexpr bool has_block_padding = original_block_size > 0 && original_block_size < 32;
+    // The reducer semaphore packs one 4-bit counter per tree round; a child bumps its round's nibble
+    // once per head, so the parent's poll below compares against head_idx + 1 and the counter must not
+    // wrap. The program factory refuses a sequence split with more than 15 heads per core.
+    static_assert(
+        num_cores_per_head == 1 || num_heads_per_core <= 15,
+        "the per-round reduction semaphore counts heads in a 4-bit nibble");
 
-    constexpr auto out_args = TensorAccessorArgs<28>();
+    constexpr auto out_args = TensorAccessorArgs<29>();
 
     constexpr uint32_t cb_mask_in = tt::CBIndex::c_3;
     constexpr uint32_t cb_identity_scale_in = tt::CBIndex::c_5;
@@ -254,28 +266,35 @@ void kernel_main() {
 
     noc.async_write_barrier();  // #19201 BH hang workaround
 
-    for (uint32_t cur_head = cur_head_group * num_heads_per_core;
-         cur_head < cur_head_group * num_heads_per_core + num_heads_per_core;
-         ++cur_head) {
+    // Non-root cores that cannot reach a parent have nothing to send and nothing to write.
+    if (!is_tree_root && !should_send_to_parent) {
+        return;
+    }
+
+    // The core's heads, in the same order on every core of the reduction group: the compute kernel
+    // emits head h's payload before head h+1's, the child sends them in that order, and the parent
+    // consumes them in that order. head_idx is the position of the head on this core -- it selects the
+    // per-head receive slot in cb_intermed_out and the semaphore count the parent waits for.
+    for (uint32_t head_idx = 0; head_idx < num_heads_per_core; ++head_idx) {
+        [[maybe_unused]] const uint32_t cur_head = cur_head_group * num_heads_per_core + head_idx;
         // Tree reduction: receive from children at each round
         // Each round, we wait for one child (if any), read remote_sum, remote_max, remote_output, and push to CBs
         // The compute kernel processes each child's data before we move to the next round
         // Only receive from children that actually have data
         if (num_active_children > 0) {
-            // If there are workers, then head must be split across workers
-            ASSERT(num_heads_per_core == 1);
-
             for (uint32_t round = 0; round < num_active_rounds; ++round) {
                 uint32_t child_id = active_children_per_round[round];
                 if (child_id != UINT32_MAX) {
-                    // Wait for this specific child to send its results
-                    // Poll until round-specific nibble is >= 1
-                    // Each round uses a 4-bit field: round 0 = bits 0-3, round 1 = bits 4-7, etc.
+                    // Wait for this specific child to send head head_idx's results.
+                    // Each round uses a 4-bit field: round 0 = bits 0-3, round 1 = bits 4-7, etc., and the
+                    // child bumps its round's nibble once per head in head order -- so the nibble is the
+                    // number of heads it has already delivered and head head_idx has landed once it
+                    // reaches head_idx + 1.
                     while (true) {
                         invalidate_l1_cache();
                         uint32_t sem_val = *in0_receiver_semaphore_addr_ptr;
                         uint8_t step_sem = (sem_val >> step_semaphore_shift[round]) & 0x0F;
-                        if (step_sem >= 1) {
+                        if (step_sem >= head_idx + 1) {
                             break;
                         }
                     }
@@ -285,8 +304,9 @@ void kernel_main() {
                     constexpr uint32_t o_read_size = out_chunk_tiles * tile_bytes_intermed;
                     constexpr uint32_t ml_read_size = PNHt * tile_bytes_intermed;
 
-                    // Calculate offset based on round (child writes at round offset)
-                    uint32_t block_offset = round * (out_chunk_tiles + 2 * PNHt) * tile_bytes_intermed;
+                    // Slot for (this head, this round); the child writes at the same index.
+                    uint32_t block_offset = (head_idx * intermed_slots_per_head + round) *
+                                            (out_chunk_tiles + 2 * PNHt) * tile_bytes_intermed;
                     CircularBuffer cb_intermed(cb_intermed_out);
                     const uint8_t noc_id = noc.get_noc_id();
                     const uint32_t my_noc_x = my_x[noc_id];
@@ -337,9 +357,9 @@ void kernel_main() {
             }
         }
 
-        // SENDER: send intermediates to parent (only need to do this ONCE, once you send you are done)
-        // We have data (checked at function start), so send it
-        if (!is_tree_root && should_send_to_parent) {
+        // SENDER: send this head's intermediates to the parent. Stage 2c: once per head, not once per
+        // core -- the loop continues to the next head instead of returning.
+        if (!is_tree_root) {
             // Wait for compute to finish writing to cb_out_worker, cb_out_m, cb_out_l
             CircularBuffer cb_out_w(cb_out_worker);
             CircularBuffer cb_out_m_buf(cb_out_m);
@@ -350,7 +370,8 @@ void kernel_main() {
             cb_out_l_buf.wait_front(PNHt);
 
             constexpr uint32_t tile_bytes = get_tile_size(cb_out_worker);
-            uint32_t block_offset = send_at_round * (out_chunk_tiles + 2 * PNHt) * tile_bytes;
+            uint32_t block_offset =
+                (head_idx * intermed_slots_per_head + send_at_round) * (out_chunk_tiles + 2 * PNHt) * tile_bytes;
             constexpr uint32_t o_write_size = out_chunk_tiles * tile_bytes;
             constexpr uint32_t ml_write_size = PNHt * tile_bytes;
 
@@ -386,17 +407,12 @@ void kernel_main() {
             // (which encodes the dst NoC addr from local_l1_addr_) is the correct fit here.
             Semaphore<>(reducer_semaphore_id).up(noc, parent_noc_x, parent_noc_y, step_semaphore_inc[send_at_round]);
 
-            // pop front
+            // pop front -- this frees the payload CBs for the compute to fill with the next head.
             cb_out_w.pop_front(out_chunk_tiles);
             cb_out_m_buf.pop_front(PNHt);
             cb_out_l_buf.pop_front(PNHt);
             noc.async_atomic_barrier();
-            // Senders can return, dont need to participate
-            return;
-        }
-
-        if (!is_tree_root) {
-            return;
+            continue;  // this core only sends; the next head is the only remaining work
         }
 
         // ROOT CORE REMAINING WRITER WORK

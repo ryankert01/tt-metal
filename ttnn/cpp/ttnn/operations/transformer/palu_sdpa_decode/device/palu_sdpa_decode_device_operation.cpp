@@ -526,17 +526,22 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
     }
     const uint32_t hpc = operation_attributes.heads_per_core;
     if (hpc != 0) {
-        TT_FATAL(
-            hpg % hpc == 0,
-            "palu_sdpa_decode: heads_per_core {} must divide heads_per_group {}",
-            hpc,
-            hpg);
+        // The KV-head check comes first: heads_per_group always divides the KV head count (validated
+        // above), so an hpc that divides the group necessarily divides the head count -- checking the
+        // group first would make this message unreachable for every input.
         TT_FATAL(
             n_kv % hpc == 0, "palu_sdpa_decode: heads_per_core {} must divide the KV head count {}", hpc, n_kv);
+        // Before the group-divisibility check: with per-head latents heads_per_group is 1, which
+        // divides nothing above 1, so the "grouped latents" message would never be the one reported.
         TT_FATAL(
             hpc == 1 || hpg > 1,
             "palu_sdpa_decode: heads_per_core {} > 1 only means something with grouped latents "
             "(heads_per_group is {}); the heads of a core must share one latent",
+            hpc,
+            hpg);
+        TT_FATAL(
+            hpg % hpc == 0,
+            "palu_sdpa_decode: heads_per_core {} must divide heads_per_group {}",
             hpc,
             hpg);
     }

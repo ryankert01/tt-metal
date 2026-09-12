@@ -213,17 +213,23 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     TT_FATAL(max_cores_per_head > 0, "max_cores_per_head_batch must be > 0");
     const uint32_t max_num_cores_for_compute = max_cores_per_head * B * num_kv_heads;
     const uint32_t num_cores_per_batch_uncapped = std::min(num_cores_available, max_num_cores_for_compute) / B;
-    const uint32_t num_cores_per_head = std::max(1u, num_cores_per_batch_uncapped / num_kv_heads);
+    uint32_t num_cores_per_head = std::max(1u, num_cores_per_batch_uncapped / num_kv_heads);
     uint32_t num_heads_per_core =
         std::max(1u, static_cast<uint32_t>(std::ceil(static_cast<float>(num_kv_heads) / num_cores_per_batch_uncapped)));
     while (num_kv_heads % num_heads_per_core != 0) {
         num_heads_per_core++;
     }
-    // Palu stage 2c: the caller can pin how many KV heads a core owns (0 = the stock rule above).
-    // With grouped latents and more than one head per core the program runs in group-shared mode:
-    // the core's heads all sit in one latent group, so the reader reads each latent chunk once and
-    // every head rebuilds its own K (and V) from it (spec 2026-09-12-palu-tt-stage2c-design.md §3.2).
-    if (operation_attributes.heads_per_core != 0) {
+    // Palu stage 2c: heads_per_core > 1 pins how many KV heads a core owns and selects group-shared
+    // mode -- the core's heads all sit in one latent group, so the reader reads each latent chunk once
+    // and every head rebuilds its own K (and V) from it (spec §3.2). heads_per_core 0 (unset) and 1
+    // both mean "the stock rule above, per-head kernel": 1 does NOT pin one head per core (that would
+    // ask for 128 items on the 64-core grid at batch 32, a layout the stock rule deliberately avoids).
+    //
+    // Pinning H changes the *item* count -- an item is now (batch, group of H heads) -- so the split of
+    // the sequence over cores has to be recomputed from it: B * num_kv_heads / H items, each spread
+    // over num_cores_per_head cores (spec §3.3). Every count below is already written in terms of the
+    // item count, so only num_cores_per_head itself needs redoing.
+    if (operation_attributes.heads_per_core > 1) {
         num_heads_per_core = operation_attributes.heads_per_core;
         TT_FATAL(
             num_kv_heads % num_heads_per_core == 0 && heads_per_group % num_heads_per_core == 0,
@@ -232,11 +238,29 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
             num_heads_per_core,
             num_kv_heads,
             heads_per_group);
+        const uint32_t items_per_batch = num_kv_heads / num_heads_per_core;
+        // Cap the split at 4 cores per item, i.e. a two-round reduction tree.
+        //
+        // Two reasons. (1) L1: in group-shared mode every core keeps one receive slot per (head, round)
+        // in c_19 (see the intermed sizing below), so that L1 grows with H * rounds and would soon cost
+        // more than the larger H buys. (2) Correctness: with three rounds -- eight cores per item, so a
+        // reduction node that has two children *and* a parent -- the group-mode reduction deadlocks.
+        // Measured on this grid: batch 8 / H = 4 and batch 4 / H = 2 both hang at 8 cores per item at
+        // any sequence long enough to give all eight cores a chunk, while every two-round layout
+        // (batch 32 / H = 4, batch 16 / H = 4, batch 8 / H = 2) and every one-round layout is correct;
+        // the per-head kernel is unaffected and still splits over up to max_cores_per_head_batch cores.
+        // The cost is that at batch <= 8 a group of four heads runs on 4 cores instead of 8, i.e. half
+        // the grid idle there -- H = 2 keeps the grid full at that batch.
+        // palu_tt.fused.group_heads_per_core models exactly this worst case (4 cores per head, 2 rounds).
+        constexpr uint32_t group_max_cores_per_head = 4;
+        num_cores_per_head =
+            std::max(1u, std::min(group_max_cores_per_head, num_cores_per_batch_uncapped / items_per_batch));
     }
     // Group-shared is opt-in: the stock rule already hands a core two heads at batch 32, but the mode
     // keeps H weight blocks resident (772 KB at the 512/512 layer) and H flash states, which that split
     // never budgeted for -- turning it on implicitly would blow L1 on the widest layers. The host picks
-    // H from an L1 estimate in stage 2c task 2; until then only an explicit heads_per_core selects it.
+    // H from an L1 estimate (palu_tt.fused.group_heads_per_core); only an explicit heads_per_core > 1
+    // selects the mode.
     const bool group_shared = heads_per_group > 1 && operation_attributes.heads_per_core > 1;
     const uint32_t H = group_shared ? num_heads_per_core : 1;  // state/weight blocks resident per core
     const uint32_t num_cores_per_batch = num_cores_per_head * num_kv_heads / num_heads_per_core;
@@ -280,13 +304,25 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
         PALU_MAX_TREE_REDUCTION_ROUNDS,
         1 << PALU_MAX_TREE_REDUCTION_ROUNDS,
         num_cores_per_head);
+    // Stage 2c Phase B lifts "not both a sequence split and several heads on a core" for the
+    // group-shared mode: there an item is (batch, group of H heads) and the tree reduction runs once per
+    // head, with the receive slots and the reduction semaphore counted per head (writer kernel).
     TT_FATAL(
-        (num_cores_per_head >= 1 && num_heads_per_core == 1) || (num_cores_per_head == 1 && num_heads_per_core >= 1),
+        group_shared || (num_cores_per_head >= 1 && num_heads_per_core == 1) ||
+            (num_cores_per_head == 1 && num_heads_per_core >= 1),
         "Invalid core assignment: cores_per_head={}, heads_per_core={}",
         num_cores_per_head,
         num_heads_per_core);
-    // A pinned heads_per_core changes the item count, so the layout can outgrow the grid (e.g. batch 32
-    // with heads_per_core=1 wants 128 single-head items on 64 cores, which is why the stock rule picks 2).
+    // The reduction semaphore packs one 4-bit counter per tree round and a child bumps its round's
+    // nibble once per head, so a core can carry at most 15 heads into a sequence-split reduction.
+    TT_FATAL(
+        num_cores_per_head == 1 || num_heads_per_core <= 15,
+        "palu_sdpa_decode: heads_per_core={} with a sequence split ({} cores per head) would overflow the "
+        "4-bit per-round reduction semaphore counter (max 15 heads)",
+        num_heads_per_core,
+        num_cores_per_head);
+    // A pinned heads_per_core changes the item count, so the layout can outgrow the grid (e.g. batch 4 on
+    // a 2x2 grid with heads_per_core=2: two items per batch and only one core per batch to put them on).
     TT_FATAL(
         num_active_cores <= num_cores_available,
         "palu_sdpa_decode: heads_per_core={} needs {} cores (batch {} x {} KV heads / {} x {} cores per "
@@ -395,8 +431,11 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
             continue;
         }
         auto physical = device->worker_core_from_logical_core(core_group[i]);
-        // Reducer index: for single KV head case, reducer index = batch index
-        // For multi KV head, would need: batch * num_kv_heads + head_within_batch
+        // Reducer index: reducer_count walks the active cores in linear order, and the cores of one
+        // batch are contiguous with the items (batch, group of num_heads_per_core heads) inside them,
+        // so this counter *is* cur_batch * (num_kv_heads / num_heads_per_core) + item_within_batch --
+        // the same index the writer recomputes as (cur_batch * num_cores_per_batch) / num_cores_per_head
+        // + cur_head_group. With one KV head per item it degenerates to the batch index.
         uint32_t idx = use_col_major_group_indexing ? get_col_major_group_idx(reducer_count) : reducer_count;
         TT_FATAL(idx < num_reducer_cores, "Reducer spatial index {} out of bounds (max {})", idx, num_reducer_cores);
         reduce_core_physical_xs[idx] = physical.x;
@@ -481,7 +520,18 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     const uint32_t out_tiles = PNHt * vDHt;
     const uint32_t scale_tiles = 1;
     const uint32_t statistics_tiles = PNHt;
-    const uint32_t intermed_output_tiles = (out_tiles + 2 * PNHt) * (num_cores_per_head - 1);
+    // Tree-reduction receive slots. The round dimension is the stock one (children of different rounds
+    // are different cores and may write at any moment). The head dimension is new in group-shared mode
+    // and is NOT optional: a child writes head h+1's payload as soon as its own writer popped head h's
+    // -- nothing in the protocol makes it wait for the parent to read -- so one slot per round would let
+    // it overwrite a payload the parent has not consumed yet. (The core-local payload CBs c_16/c_17/c_18
+    // stay single-block: there the producer is this core's own compute and the CB back-pressures it.)
+    // With num_heads_per_core == 1 this is exactly the stock (num_cores_per_head - 1) sizing.
+    const uint32_t intermed_slots_per_head =
+        num_cores_per_head <= 1
+            ? 0
+            : (num_heads_per_core > 1 ? num_tree_reduction_rounds : num_cores_per_head - 1);
+    const uint32_t intermed_output_tiles = (out_tiles + 2 * PNHt) * intermed_slots_per_head * num_heads_per_core;
 
     // ========== Data Formats ==========
     const tt::DataFormat q_df = tt_metal::datatype_to_dataformat_converter(input_tensor_q.dtype());
@@ -712,20 +762,22 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     }
 
     // Intermediate CBs
-    // Group-shared: the flash state of the H heads a core owns lives in these CBs as H whole blocks
-    // that rotate through the FIFO, one block per head per chunk, so every one of them is H x its
-    // per-head size. (c_24 is consumed inside a head's chunk step and stays one block.)
+    // Group-shared: only the *persistent* flash state needs one block per head -- O (c_26), m (c_28) and
+    // l (c_30) survive a head's chunk step and the FIFO must hand each head its own block back at the
+    // front on the next chunk. Everything else here is filled and drained inside a single head's chunk
+    // step (or a single reduction round), so it stays one block exactly as in the per-head kernel; that
+    // reclaimed L1 is what lets the host pick a larger H (palu_tt.fused.group_heads_per_core).
     add_cb(CBIndex::c_24, qk_tiles * im_tile_size, im_df, im_tile_size, &im_tile);
-    add_cb(CBIndex::c_25, H * out_tiles * im_tile_size, im_df, im_tile_size, &im_tile);
+    add_cb(CBIndex::c_25, out_tiles * im_tile_size, im_df, im_tile_size, &im_tile);
     add_cb(CBIndex::c_26, H * out_tiles * im_tile_size, im_df, im_tile_size, &im_tile);
-    add_cb(CBIndex::c_27, H * statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
+    add_cb(CBIndex::c_27, statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
     add_cb(CBIndex::c_28, H * statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
-    add_cb(CBIndex::c_29, H * statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
+    add_cb(CBIndex::c_29, statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
     add_cb(CBIndex::c_30, H * statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
-    add_cb(CBIndex::c_31, H * statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
-    add_cb(CBIndex::c_21, H * statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
-    add_cb(CBIndex::c_22, H * statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
-    add_cb(CBIndex::c_23, H * out_tiles * im_tile_size, im_df, im_tile_size, &im_tile);
+    add_cb(CBIndex::c_31, statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
+    add_cb(CBIndex::c_21, statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
+    add_cb(CBIndex::c_22, statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
+    add_cb(CBIndex::c_23, out_tiles * im_tile_size, im_df, im_tile_size, &im_tile);
 
     // Output CBs
     add_cb(CBIndex::c_16, out_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
@@ -861,6 +913,7 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
         sliding_window_size,
         num_tree_reduction_rounds,
         original_block_size,
+        intermed_slots_per_head,
     };
     tt_metal::TensorAccessorArgs(output_tensor.buffer()).append_to(writer_compile_time_args_common);
 

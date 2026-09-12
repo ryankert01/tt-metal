@@ -342,12 +342,9 @@ void kernel_main() {
      */
     static_assert(recon_v, "group-shared mode rebuilds V on core: grouped latents always carry u_v");
     static_assert(is_causal && !use_attention_mask, "group-shared mode is causal-only (Palu envelope)");
+    static_assert(!use_attention_sink, "group-shared mode has no attention-sink finalize");
+    static_assert(!untilize_output, "group-shared mode emits tilized output only");
     constexpr uint32_t H = num_heads_per_core;
-    // Phase A: the factory rejects a sequence split on a core that owns several heads, so this core has
-    // no tree-reduction children and the child bookkeeping above is unused here (Task 2 uses it).
-    (void)num_active_children;
-    (void)num_active_rounds;
-    (void)active_children_per_round;
     CircularBuffer(cb_w_rot).wait_front(H * w_rot_cb_tiles);  // the core's H weight blocks, resident
 
 #ifdef PALU_PHASE2
@@ -497,35 +494,112 @@ void kernel_main() {
     CircularBuffer(cb_qrot).pop_front(2 * q_chunk_tiles);  // the last [q~ | q~ T]
 #endif
 
-    /* Per-head finalize. Phase A: the factory keeps num_cores_per_head == 1 whenever a core owns more
-     * than one head, so no core has children here and every core is its own tree root (Task 2 adds the
-     * per-head reduction). Each of the three loops below keeps the ring invariant: 1/l rotates c_30 by
-     * one block per head, so after H calls head 0 is back at the front; O_h *= 1/l_h rotates c_26 the
-     * same way while draining c_30; only then is each head's output emitted, in head order -- which is
-     * the order the writer's per-head loop consumes cb_out_final in. */
-    if (is_tree_root) {
-        for (uint32_t h = 0; h < H; ++h) {
+    /******************************************************************************
+     *      PER-HEAD TREE REDUCTION AND FINALIZE (Phase B): strictly sequential     *
+     ******************************************************************************
+     * A core can own H heads *and* share the sequence split with num_cores_per_head cores. Head h's
+     * reduction and its output have to be interleaved, not run as an H-long pass each: the writer's
+     * loop is "receive head h, then send/write head h", so a compute that finished every head's
+     * reduction before emitting head 0's payload would deadlock against a writer waiting for head 0's
+     * payload before receiving head 1's.
+     *
+     * The head's state is *peeled out of the rings first*. c_26 (O), c_28 (m) and c_30 (l) hold one
+     * block per head with head h at the front, and this loop pops exactly one block from each, in head
+     * order -- the rings are never rotated here. Everything after the peel is the per-head kernel's
+     * reduction and finalize, verbatim, on single-block CBs: no FIFO bookkeeping to get wrong, and the
+     * numbers go through the same helpers in the same order, so head h's result is bit-identical.
+     *
+     * The three scratch CBs are the chunk loop's own, provably drained once the loop is over: c_25 held
+     * the PV product (and is exactly one O block), c_24 the QK scores, c_10 the AB rows. All three are
+     * bf16, like the state they take over.
+     *
+     * The payload CBs (cb_out_o / cb_out_m / cb_out_l) and the reduction scratch (c_21, c_22, c_23,
+     * c_27, c_29, c_31) are single-block for the same reason: head h's payload is consumed by the
+     * writer before head h + 1's is produced, and that single block is the back-pressure keeping the
+     * two in step. cb_intermed_out is the one exception and IS sized per head (see the program
+     * factory): its producer is a *remote* core, which nothing here can back-pressure.
+     */
+    constexpr uint32_t cb_o_head = cb_out_im;  // c_25: exactly out_chunk_tiles, i.e. one O block
+    constexpr uint32_t cb_m_head = cb_qk_im;   // c_24
+    constexpr uint32_t cb_l_head = cb_ab;      // c_10
+    static_assert(Sq_chunk_t * Sk_chunk_t >= Sq_chunk_t, "c_24 must hold one statistics block");
+    static_assert(2 * Wt >= Sq_chunk_t, "c_10 must hold one statistics block");
+
+    for (uint32_t head = 0; head < H; ++head) {
+        // Peel head's O, m and l out of the rings (front = head, in head order).
+        reconfig_data_format(cb_out_accumulate_im, cb_out_accumulate_im);
+        pack_reconfig_data_format(cb_o_head);
+        move_block<true>(cb_out_accumulate_im, cb_o_head, out_chunk_tiles);
+        reconfig_data_format(cb_prev_max, cb_prev_max);
+        pack_reconfig_data_format(cb_m_head);
+        move_block<true>(cb_prev_max, cb_m_head, Sq_chunk_t);
+        pack_reconfig_data_format(cb_l_head);
+        move_block<true>(cb_prev_sum, cb_l_head, Sq_chunk_t);
+
+        // Tree reduction: merge each child's (l, m, O) for this head. The writer has already moved the
+        // child's payload into cb_l_in / cb_m_in / cb_out_o, one round at a time.
+        if (num_active_children > 0) {
+            for (uint32_t round = 0; round < num_active_rounds; ++round) {
+                if (active_children_per_round[round] == UINT32_MAX) {
+                    continue;
+                }
+                move_block<true>(cb_l_in, cb_prev_sum_2, Sq_chunk_t);
+
+                // Softmax correction, spelled out with the primitives the flash loop itself uses rather
+                // than the fused correction_block: cur_max = max(m, m_child), the two
+                // exp((m - cur_max) * scale) factors, then l and O rescaled and added.
+                //
+                // correction_block does exactly this in one dst acquisition (five operands through dst
+                // registers 0..4, fused_max_sub_exp_add_tile), and it is what the per-head branch below
+                // uses -- but in *this* branch it returns the local max as the merged max, which sends
+                // the child's exp factor to zero and drops its contribution entirely. Measured: the op's
+                // output was then the reducer core's own slice, normalised by its own l, to the last bit
+                // (PCC 1.0000 against a host reference over that slice) while the child's l, m and O were
+                // all verified to arrive correctly in c_7 / c_6 / c_16. Why the fused helper misbehaves
+                // here and not in the per-head branch was not established; the primitives below are the
+                // same arithmetic in the same order and cost four extra dst acquisitions per child.
+                max_block<vector_mode>(cb_m_head, cb_m_in, cb_cur_max, Sq_chunk_t);
+                sub_exp_block<scale_fp32>(cb_m_head, cb_cur_max, cb_exp_max_diff, Sq_chunk_t);
+                sub_exp_block<scale_fp32>(cb_m_in, cb_cur_max, cb_exp_max_diff_2, Sq_chunk_t);
+
+                // l = l * EXP_MAX_DIFF + l_child * EXP_MAX_DIFF_2
+                mul_block_inplace(cb_l_head, cb_exp_max_diff, Sq_chunk_t);
+                mul_block_inplace(cb_prev_sum_2, cb_exp_max_diff_2, Sq_chunk_t);
+                add_block_inplace<true>(cb_l_head, cb_prev_sum_2, Sq_chunk_t);
+
+                // OUT_ACC_2 <- CHILD_OUT; O = O * EXP_MAX_DIFF + O_child * EXP_MAX_DIFF_2
+                move_block<true>(cb_out_o, cb_out_accumulate_im_2, out_chunk_tiles);
+                mul_block_bcast_cols_inplace<Sq_chunk_t, vDHt>(cb_o_head, cb_exp_max_diff);
+                mul_block_bcast_cols_inplace<Sq_chunk_t, vDHt>(cb_out_accumulate_im_2, cb_exp_max_diff_2);
+                add_block_inplace<true>(cb_o_head, cb_out_accumulate_im_2, out_chunk_tiles);
+
+                // m <- cur_max
+                CircularBuffer(cb_m_head).pop_front(Sq_chunk_t);
+                CircularBuffer(cb_m_in).pop_front(Sq_chunk_t);
+                move_block<true>(cb_cur_max, cb_m_head, Sq_chunk_t);
+            }
+        }
+
+        if (is_tree_root) {
             /* SUM = 1.0 / SUM */
-            reconfig_data_format(cb_prev_sum, cb_prev_sum);
-            pack_reconfig_data_format(cb_prev_sum);
-            recip_block_inplace(cb_prev_sum, Sq_chunk_t);
-        }
-        for (uint32_t h = 0; h < H; ++h) {
-            /* OUT_ACC *= 1/SUM (cb_prev_sum is consumed and popped) */
-            reconfig_data_format(cb_out_accumulate_im, cb_prev_sum);
-            pack_reconfig_data_format(cb_out_accumulate_im);
-            mul_block_bcast_cols_inplace<Sq_chunk_t, vDHt>(cb_out_accumulate_im, cb_prev_sum);
-        }
-        for (uint32_t h = 0; h < H; ++h) {
+            reconfig_data_format(cb_l_head, cb_l_head);
+            pack_reconfig_data_format(cb_l_head);
+            recip_block_inplace(cb_l_head, Sq_chunk_t);
+
+            /* OUT_ACC *= 1/SUM (cb_l_head is consumed and popped) */
+            reconfig_data_format(cb_o_head, cb_l_head);
+            pack_reconfig_data_format(cb_o_head);
+            mul_block_bcast_cols_inplace<Sq_chunk_t, vDHt>(cb_o_head, cb_l_head);
+
             pack_reconfig_data_format(cb_out_final);
-            CircularBuffer(cb_prev_max).pop_front(Sq_chunk_t);
-            move_block<true>(cb_out_accumulate_im, cb_out_final, out_chunk_tiles);
-        }
-    } else if (has_parent) {
-        for (uint32_t h = 0; h < H; ++h) {
-            move_block<true>(cb_out_accumulate_im, cb_out_o, out_chunk_tiles);
-            move_block<true>(cb_prev_max, cb_out_m, Sq_chunk_t);
-            move_block<true>(cb_prev_sum, cb_out_l, Sq_chunk_t);
+            CircularBuffer(cb_m_head).pop_front(Sq_chunk_t);
+            move_block<true>(cb_o_head, cb_out_final, out_chunk_tiles);
+        } else if (has_parent) {
+            // Emit this head's payload for the writer to send to the parent; the three CBs hold one
+            // block each, so the next head waits here until the writer has sent and popped them.
+            move_block<true>(cb_o_head, cb_out_o, out_chunk_tiles);
+            move_block<true>(cb_m_head, cb_out_m, Sq_chunk_t);
+            move_block<true>(cb_l_head, cb_out_l, Sq_chunk_t);
         }
     }
 
