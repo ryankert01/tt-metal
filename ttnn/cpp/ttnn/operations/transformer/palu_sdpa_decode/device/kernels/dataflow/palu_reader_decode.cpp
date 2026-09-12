@@ -319,6 +319,34 @@ void kernel_main() {
         cb_page_table.push_back(num_pages_to_read);
     }
 
+#ifdef PALU_GROUP_SHARED
+    // ---------------- Group-shared mode (stage 2c) ----------------
+    // The core's heads are contiguous inside one latent group (the host guarantees heads_per_core
+    // divides heads_per_group), so lat_head = cur_head / heads_per_group is the same for all of them
+    // and every latent chunk is read ONCE for the whole group instead of once per head. Q is per
+    // (batch, core) and was already read above. The weight blocks are pushed head by head and stay
+    // resident in c_4 for the run; compute indexes block h from the CB base.
+    {
+        static_assert(!is_paged_attention, "group-shared mode is the unpaged Palu path");
+        const uint32_t head_base = cur_head_group * num_heads_per_core;
+        const uint32_t lat_head = head_base / heads_per_group;  // the group's latent
+        ASSERT((head_base + num_heads_per_core - 1) / heads_per_group == lat_head);
+        for (uint32_t h = 0; h < num_heads_per_core; ++h) {
+            read_w_rot<cb_w_rot, Rt, Wt, Rvt, DHt, barrier_threshold, phase2, recon_v>(
+                head_base + h, w_rot_reader, u_v_reader, trans_mat_reader);
+        }
+        const uint32_t n_lat_heads = num_kv_heads / heads_per_group;
+        const uint32_t lat_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * n_lat_heads * St * Rt;
+        const uint32_t lat_start_tile_id =
+            lat_batch_offset + lat_head * St * Rt + k_chunk_start * Sk_chunk_t_dynamic * Rt;
+        const uint32_t v_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * n_lat_heads * St * Rvt;
+        const uint32_t v_start_tile_id =
+            v_batch_offset + lat_head * St * Rvt + k_chunk_start * Sk_chunk_t_dynamic * Rvt;
+        read_palu_chunks<Rt, Rvt, Wt, barrier_threshold, cb_lat_in, cb_v_in, cb_cs_in, phase2>(
+            k_chunk_start, k_chunk_end, lat_start_tile_id, v_start_tile_id, Sk_chunk_t_dynamic,
+            k_reader, v_reader, cs_reader);
+    }
+#else
     for (uint32_t cur_head = cur_head_group * num_heads_per_core;
          cur_head < cur_head_group * num_heads_per_core + num_heads_per_core;
          ++cur_head) {
@@ -406,4 +434,5 @@ void kernel_main() {
                 k_reader, v_reader, cs_reader);
         }
     }
+#endif
 }

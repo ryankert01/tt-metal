@@ -524,6 +524,22 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
             "head only",
             hpg);
     }
+    const uint32_t hpc = operation_attributes.heads_per_core;
+    if (hpc != 0) {
+        TT_FATAL(
+            hpg % hpc == 0,
+            "palu_sdpa_decode: heads_per_core {} must divide heads_per_group {}",
+            hpc,
+            hpg);
+        TT_FATAL(
+            n_kv % hpc == 0, "palu_sdpa_decode: heads_per_core {} must divide the KV head count {}", hpc, n_kv);
+        TT_FATAL(
+            hpc == 1 || hpg > 1,
+            "palu_sdpa_decode: heads_per_core {} > 1 only means something with grouped latents "
+            "(heads_per_group is {}); the heads of a core must share one latent",
+            hpc,
+            hpg);
+    }
     expect(tensor_args.cs_tab, "cs_tab", {1, 1, 0, 2 * D_palu}, DataType::BFLOAT16);
     TT_FATAL(tensor_args.cs_tab.padded_shape()[2] >= S, "palu_sdpa_decode: cs_tab has {} rows, cache has {}", tensor_args.cs_tab.padded_shape()[2], S);
     if (operation_attributes.cs_recurrence) {
@@ -611,6 +627,7 @@ Tensor palu_sdpa_decode(
     const std::optional<const Tensor>& trans_mat,
     const std::optional<const Tensor>& u_v,
     uint32_t head_dim_v,
+    std::optional<uint32_t> heads_per_core,
     std::optional<float> scale,
     const tt::tt_metal::MemoryConfig& output_mem_config,
     const std::optional<ttnn::operations::transformer::SDPAProgramConfig>& program_config,
@@ -644,6 +661,7 @@ Tensor palu_sdpa_decode(
         .cs_recurrence = rot_step.has_value(),
         .heads_per_group = n_kv / n_groups,
         .recon_v = u_v.has_value(),
+        .heads_per_core = heads_per_core.value_or(0),
     };
     auto tensor_args = OperationType::tensor_args_t{
         .q = input_tensor_q,

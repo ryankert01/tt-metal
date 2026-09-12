@@ -318,6 +318,220 @@ void kernel_main() {
     uint32_t cb_cur_sum = cb_sum_1;
     uint32_t cb_prev_sum = cb_sum_2;
 
+#ifdef PALU_GROUP_SHARED
+    /******************************************************************************
+     *          GROUP-SHARED MODE (stage 2c): chunk outer, head inner              *
+     ******************************************************************************
+     * The num_heads_per_core KV heads this core owns all sit in one latent group, so the reader
+     * pushes each latent chunk once and every head rebuilds its own K (and V) from it with its own
+     * resident weight block in c_4. Everything else is the per-head kernel in the #else branch, in
+     * the same order: head h's math and chunk order are untouched, so its output is bit-identical.
+     *
+     * The per-head flash state (m in c_28, l in c_30, O in c_26) lives in those CBs as a ring of H
+     * blocks: every head runs the identical wait/pop/reserve/push sequence on each of them per chunk,
+     * so the ring hands head h its own block back at the front on the next chunk. Two in-place
+     * helpers rotate the block they update to the back of the ring in the middle of a head's step and
+     * are read again right after (mul_block_inplace on l, mul_block_bcast_cols on O); after those the
+     * ring is closed back up with palu_rotate_blocks, which is pointer-only -- the data never moves.
+     * The other state CBs (c_24, c_25, c_27, c_29, c_31) are emptied inside a head's step.
+     *
+     * Q is per (batch, core), not per head: the reader reads one Q block for the core and the writer
+     * picks head h's rows out of each result, so all H heads share c_0 and, in Phase 2, the single
+     * rotated-query state in c_12 -- same seed, same per-chunk step for every head, so computing it
+     * once is bit-identical to computing it H times.
+     */
+    static_assert(recon_v, "group-shared mode rebuilds V on core: grouped latents always carry u_v");
+    static_assert(is_causal && !use_attention_mask, "group-shared mode is causal-only (Palu envelope)");
+    constexpr uint32_t H = num_heads_per_core;
+    // Phase A: the factory rejects a sequence split on a core that owns several heads, so this core has
+    // no tree-reduction children and the child bookkeeping above is unused here (Task 2 uses it).
+    (void)num_active_children;
+    (void)num_active_rounds;
+    (void)active_children_per_round;
+    CircularBuffer(cb_w_rot).wait_front(H * w_rot_cb_tiles);  // the core's H weight blocks, resident
+
+#ifdef PALU_PHASE2
+    // q~ = q R_{-k_chunk_start c}: seeded once for the core (trans_mat is the same tile in every block)
+    palu_init_q_state<cb_q_in, cb_qrot, cb_w_rot, q_chunk_tiles, w_rot_cb_tiles>(t_tile_idx);
+    for (uint32_t s = 0; s < k_chunk_start; ++s) {
+        palu_step_q<cb_qrot, cb_rot_step, DHt, Sq_chunk_t>();
+    }
+#endif
+
+    uint32_t cb_out_mm = cb_out_accumulate_im;  // the first chunk seeds O, later chunks add into it
+    for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
+#ifdef PALU_PHASE2
+        if (k_chunk > k_chunk_start) {
+            palu_step_q<cb_qrot, cb_rot_step, DHt, Sq_chunk_t>();  // q~ <- q~ R_{-c}
+        }
+#endif
+        for (uint32_t h = 0; h < H; ++h) {
+            const uint32_t w_base = h * w_rot_cb_tiles;  // this head's [u_k | u_k T | u_v | T] block
+
+            // ---- Palu: rebuild this head's K for the shared chunk into cb_k_in ----
+            palu_build_k_chunk<cb_lat_in, cb_w_rot, cb_ab, cb_cs_in, cb_k_in, Rt, DHt, PALU_DST_TILES, false>(
+                Sk_chunk_t_dynamic, /*cs_tile_base=*/0, w_base);
+
+            /* QK = Q_CHUNK @ K_CHUNK */
+            reconfig_data_format(cb_k_in, cb_q_src);
+            pack_reconfig_data_format(cb_qk_im);
+            matmul_blocks(
+                cb_q_src,
+                cb_k_in,
+                cb_qk_im,
+                Sq_chunk_t,
+                Sk_chunk_t_dynamic,
+                DHt,
+                qk_num_blocks,
+                qk_in0_num_subblocks_dynamic,
+                qk_in1_num_subblocks_dynamic,
+                qk_in0_block_w,
+                qk_subblock_h_dynamic,
+                qk_subblock_w_dynamic,
+                true,
+                false,
+                cb_mask_in,
+                cb_zero_in);
+
+            /* QK += MASK: causal decode masks the last chunk only, and never pops the mask CB */
+            if (k_chunk == k_chunk_end - 1 && apply_mask_at_last_chunk) {
+                reconfig_data_format(cb_qk_im, cb_mask_in);
+                add_block_inplace<false>(cb_qk_im, cb_mask_in, qk_chunk_tiles_dynamic);
+            }
+
+            /* CUR_MAX = eltwise_max(PREV_MAX, max(QK, dim=-1)) */
+            reconfig_data_format(cb_qk_im, cb_identity_scale_in);
+            pack_reconfig_data_format(cb_cur_max);
+            reduce_c<PoolType::MAX, ReduceDim::REDUCE_ROW, cb_qk_im, cb_identity_scale_in, Sq_chunk_t, vector_mode>(
+                cb_cur_max, cb_prev_max, Sk_chunk_t_dynamic, k_chunk > k_chunk_start);
+
+            /* QK = exp((QK - CUR_MAX) * scale) */
+            reconfig_data_format(cb_qk_im, cb_cur_max);
+            pack_reconfig_data_format(cb_qk_im);
+            sub_exp_block_bcast_cols_inplace<cb_qk_im, Sq_chunk_t, scale_fp32, true, false, vector_mode>(
+                cb_cur_max, cb_cur_sum, Sk_chunk_t_dynamic);
+            CircularBuffer(cb_qk_im).wait_front(qk_chunk_tiles_dynamic);
+
+            /* CUR_SUM = sum(QK, dim=-1) */
+            reconfig_data_format(cb_qk_im, cb_identity_scale_in);
+            pack_reconfig_data_format(cb_cur_sum);
+            reduce_c<PoolType::SUM, ReduceDim::REDUCE_ROW, cb_qk_im, cb_identity_scale_in, Sq_chunk_t, vector_mode>(
+                cb_cur_sum, cb_cur_sum, Sk_chunk_t_dynamic, false);
+
+            // V_h for this chunk: the QK matmul has consumed cb_k_in, so the rebuilt V takes its slot
+            palu_build_v_chunk<cb_v_in, cb_w_rot, cb_k_in, Rvt, vDHt, PALU_DST_TILES, false>(
+                Sk_chunk_t_dynamic, w_base + uv_tile_base);
+
+            /* OUT_IM = QK @ V_CHUNK */
+            reconfig_data_format(cb_v_src, cb_qk_im);
+            pack_reconfig_data_format(cb_out_im);
+            matmul_blocks(
+                cb_qk_im,
+                cb_v_src,
+                cb_out_mm,
+                Sq_chunk_t,
+                vDHt,
+                Sk_chunk_t_dynamic,
+                out_num_blocks_dynamic,
+                out_in0_num_subblocks,
+                out_in1_num_subblocks,
+                out_in0_block_w_dynamic,
+                out_subblock_h,
+                out_subblock_w,
+                false /*transpose*/,
+                false,
+                cb_mask_in,
+                cb_zero_in);
+            reconfig_data_format_srca(cb_out_im);
+            CircularBuffer(cb_qk_im).pop_front(qk_chunk_tiles_dynamic);
+
+            if (k_chunk > k_chunk_start) {
+                /* EXP_MAX_DIFF = exp(PREV_MAX - CUR_MAX) */
+                reconfig_data_format(cb_prev_max, cb_cur_max);
+                pack_reconfig_data_format(cb_exp_max_diff);
+                sub_exp_block<scale_fp32>(cb_prev_max, cb_cur_max, cb_exp_max_diff, Sq_chunk_t);
+                CircularBuffer(cb_prev_max).pop_front(Sq_chunk_t);
+
+                /* PREV_SUM *= EXP_MAX_DIFF (rotates this head's block to the back: close the ring) */
+                mul_block_inplace(cb_prev_sum, cb_exp_max_diff, Sq_chunk_t);
+                palu_rotate_blocks(cb_prev_sum, Sq_chunk_t, H - 1);
+
+                /* OUT_ACC *= EXP_MAX_DIFF (same rotation) */
+                reconfig_data_format(cb_out_accumulate_im, cb_exp_max_diff);
+                pack_reconfig_data_format(cb_out_accumulate_im);
+                mul_block_bcast_cols<Sq_chunk_t, vDHt, true, false>(
+                    cb_out_accumulate_im, cb_exp_max_diff, cb_out_accumulate_im);
+                palu_rotate_blocks(cb_out_accumulate_im, out_chunk_tiles, H - 1);
+
+                /* CUR_SUM += PREV_SUM */
+                reconfig_data_format(cb_cur_sum, cb_prev_sum);
+                pack_reconfig_data_format(cb_cur_sum);
+                add_block_inplace<true>(cb_cur_sum, cb_prev_sum, Sq_chunk_t);
+
+                /* OUT_ACC += OUT_IM */
+                reconfig_data_format(cb_out_accumulate_im, cb_out_im);
+                pack_reconfig_data_format(cb_out_accumulate_im);
+                add_block_inplace<true>(cb_out_accumulate_im, cb_out_im, out_chunk_tiles);
+            }
+
+            // PREV_MAX <- CUR_MAX, PREV_SUM <- CUR_SUM (this head's block goes back to the ring)
+            reconfig_data_format(cb_cur_max, cb_cur_max);
+            pack_reconfig_data_format(cb_prev_max);
+            move_block<true>(cb_cur_max, cb_prev_max, Sq_chunk_t);
+            move_block<true>(cb_cur_sum, cb_prev_sum, Sq_chunk_t);
+
+            if (h + 1 == H) {  // the shared chunk is spent: release it for the reader's next push
+                CircularBuffer(cb_lat_in).pop_front(Sk_chunk_t_dynamic * Rt);
+                CircularBuffer(cb_v_in).pop_front(Sk_chunk_t_dynamic * Rvt);
+#ifndef PALU_PHASE2
+                CircularBuffer(cb_cs_in).pop_front(Sk_chunk_t_dynamic * Wt);  // Phase 1: streamed rows
+#endif
+            }
+        }
+        cb_out_mm = cb_out_im;
+    }
+
+    /* END OF FLASH ATTENTION LOOP */
+    CircularBuffer(cb_w_rot).pop_front(H * w_rot_cb_tiles);
+#ifdef PALU_PHASE2
+    CircularBuffer(cb_qrot).pop_front(2 * q_chunk_tiles);  // the last [q~ | q~ T]
+#endif
+
+    /* Per-head finalize. Phase A: the factory keeps num_cores_per_head == 1 whenever a core owns more
+     * than one head, so no core has children here and every core is its own tree root (Task 2 adds the
+     * per-head reduction). Each of the three loops below keeps the ring invariant: 1/l rotates c_30 by
+     * one block per head, so after H calls head 0 is back at the front; O_h *= 1/l_h rotates c_26 the
+     * same way while draining c_30; only then is each head's output emitted, in head order -- which is
+     * the order the writer's per-head loop consumes cb_out_final in. */
+    if (is_tree_root) {
+        for (uint32_t h = 0; h < H; ++h) {
+            /* SUM = 1.0 / SUM */
+            reconfig_data_format(cb_prev_sum, cb_prev_sum);
+            pack_reconfig_data_format(cb_prev_sum);
+            recip_block_inplace(cb_prev_sum, Sq_chunk_t);
+        }
+        for (uint32_t h = 0; h < H; ++h) {
+            /* OUT_ACC *= 1/SUM (cb_prev_sum is consumed and popped) */
+            reconfig_data_format(cb_out_accumulate_im, cb_prev_sum);
+            pack_reconfig_data_format(cb_out_accumulate_im);
+            mul_block_bcast_cols_inplace<Sq_chunk_t, vDHt>(cb_out_accumulate_im, cb_prev_sum);
+        }
+        for (uint32_t h = 0; h < H; ++h) {
+            pack_reconfig_data_format(cb_out_final);
+            CircularBuffer(cb_prev_max).pop_front(Sq_chunk_t);
+            move_block<true>(cb_out_accumulate_im, cb_out_final, out_chunk_tiles);
+        }
+    } else if (has_parent) {
+        for (uint32_t h = 0; h < H; ++h) {
+            move_block<true>(cb_out_accumulate_im, cb_out_o, out_chunk_tiles);
+            move_block<true>(cb_prev_max, cb_out_m, Sq_chunk_t);
+            move_block<true>(cb_prev_sum, cb_out_l, Sq_chunk_t);
+        }
+    }
+
+    // Free up cb_q_in after Q chunks
+    CircularBuffer(cb_q_in).pop_front(q_chunk_tiles);
+#else
     // Loop through all heads assigned to core
     for (uint32_t cur_head_work = 0; cur_head_work < num_heads_per_core; ++cur_head_work) {
         // Reset ping-pong buffer assignments at the start of each head iteration
@@ -747,4 +961,5 @@ void kernel_main() {
 
     // Free up cb_q_in after Q chunks
     CircularBuffer(cb_q_in).pop_front(q_chunk_tiles);
+#endif
 }

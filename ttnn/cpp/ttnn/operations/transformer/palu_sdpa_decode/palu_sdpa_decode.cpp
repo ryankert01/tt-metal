@@ -48,6 +48,7 @@ ttnn::Tensor palu_sdpa_decode(
     const std::optional<const Tensor>& rot_step,
     const std::optional<const Tensor>& trans_mat,
     const std::optional<const Tensor>& u_v,
+    std::optional<uint32_t> heads_per_core,
     std::optional<float> scale,
     const std::optional<MemoryConfig>& memory_config,
     std::optional<ttnn::operations::transformer::SDPAProgramConfig> program_config,
@@ -100,8 +101,9 @@ ttnn::Tensor palu_sdpa_decode(
         input_tensor_q.device()->arch(), compute_kernel_config, tt::tt_metal::MathFidelity::HiFi2, true, false, false);
 
     return ttnn::prim::palu_sdpa_decode(
-        input_tensor_q, k_latent, w_rot, cs_tab, v_latent, cur_pos_tensor, rot_step, trans_mat, u_v, head_dim_v, scale,
-        memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG), program_config, kernel_config_val, k_chunk_size);
+        input_tensor_q, k_latent, w_rot, cs_tab, v_latent, cur_pos_tensor, rot_step, trans_mat, u_v, head_dim_v,
+        heads_per_core, scale, memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG), program_config,
+        kernel_config_val, k_chunk_size);
 }
 
 }  // namespace ttnn::transformer

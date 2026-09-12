@@ -50,6 +50,12 @@ void bind_palu_sdpa_decode(nb::module_& mod) {
         v_latent @ u_v[h]; head_dim_v must then be 128. Without u_v the V latent is attended over
         directly (the absorbed-V path) and its width must equal head_dim_v.
 
+        heads_per_core (stage 2c, optional): how many KV heads one core owns. None keeps the stock
+        work split. With grouped latents and heads_per_core > 1 the program runs in group-shared mode:
+        the core's heads all belong to one latent group, so every latent chunk is read once for all of
+        them and each head rebuilds its own K (and V) from it. It must divide both heads_per_group and
+        the KV head count, and the resulting layout must still fit the core grid.
+
         Envelope: head_dim 128, r_k a multiple of 32 in 32..512, batch <= 32, causal, unpaged,
         no mask / sink / sliding window. Returns [1, B, n_q, head_dim_v].
         )doc";
@@ -69,6 +75,7 @@ void bind_palu_sdpa_decode(nb::module_& mod) {
         nb::arg("rot_step") = nb::none(),
         nb::arg("trans_mat") = nb::none(),
         nb::arg("u_v") = nb::none(),
+        nb::arg("heads_per_core") = nb::none(),
         nb::arg("scale") = nb::none(),
         nb::arg("memory_config") = nb::none(),
         nb::arg("program_config") = nb::none(),

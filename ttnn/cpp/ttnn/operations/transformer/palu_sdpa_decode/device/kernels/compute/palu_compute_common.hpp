@@ -10,7 +10,10 @@
 // packed into cb_k at index j * Sk_chunk_t + i: column-major over the chunk, which is the layout the
 // stock QK matmul_blocks(..., transpose=true) reads K in. cs tiles are read at
 // cs_tile_base + i*Wt + j and are NOT popped (the caller decides: Phase 1 pops the streamed chunk,
-// Phase 2 keeps the resident table). The latent rows are popped here; cb_w stays resident.
+// Phase 2 keeps the resident table). cb_w stays resident and this head's block starts at
+// w_block_base (group-shared mode keeps the core's H blocks resident; 0 otherwise). The latent rows
+// are popped here unless pop_latent is false -- the group-shared caller pops the shared chunk once,
+// after the last head of the core has rebuilt its K from it.
 template <
     uint32_t cb_lat,
     uint32_t cb_w,
@@ -19,13 +22,14 @@ template <
     uint32_t cb_k,
     uint32_t Rt,
     uint32_t DHt,
-    uint32_t dst_tiles>
-ALWI void palu_build_k_chunk(uint32_t Sk_chunk_t, uint32_t cs_tile_base) {
+    uint32_t dst_tiles,
+    bool pop_latent = true>
+ALWI void palu_build_k_chunk(uint32_t Sk_chunk_t, uint32_t cs_tile_base, uint32_t w_block_base = 0) {
     constexpr uint32_t Wt = 2 * DHt;
     constexpr uint32_t ab_w = Wt > dst_tiles ? dst_tiles : Wt;  // output columns per dest acquisition
     constexpr uint32_t ab_subblocks = Wt / ab_w;
     CircularBuffer lat(cb_lat), w(cb_w), ab(cb_ab), cs(cb_cs), k(cb_k);
-    w.wait_front(Rt * Wt);
+    w.wait_front(w_block_base + Rt * Wt);
     cs.wait_front(cs_tile_base + Sk_chunk_t * Wt);
     k.reserve_back(Sk_chunk_t * DHt);
     for (uint32_t i = 0; i < Sk_chunk_t; ++i) {
@@ -38,7 +42,7 @@ ALWI void palu_build_k_chunk(uint32_t Sk_chunk_t, uint32_t cs_tile_base) {
         for (uint32_t sub = 0; sub < ab_subblocks; ++sub) {
             tile_regs_acquire();
             uint32_t in0_index = i * Rt;
-            uint32_t in1_index = sub * ab_w;
+            uint32_t in1_index = w_block_base + sub * ab_w;
             for (uint32_t kt = 0; kt < Rt; ++kt) {
                 matmul_block(cb_lat, cb_w, in0_index, in1_index, 0, false, ab_w, 1, Rt);
                 in0_index++;
@@ -72,7 +76,27 @@ ALWI void palu_build_k_chunk(uint32_t Sk_chunk_t, uint32_t cs_tile_base) {
         ab.pop_front(Wt);
     }
     k.push_back(Sk_chunk_t * DHt);
-    lat.pop_front(Sk_chunk_t * Rt);
+    if constexpr (pop_latent) {
+        lat.pop_front(Sk_chunk_t * Rt);
+    }
+}
+
+// ---------------- Group-shared mode: FIFO rotation of a per-head state block ----------------
+// Rotate a state CB by `blocks` whole blocks of `tiles` tiles WITHOUT touching the data. Only valid
+// when the CB is exactly full (produced == capacity): the write pointer then sits on the front block,
+// so pop_front + reserve_back + push_back re-publishes the very bytes that were popped, at the back of
+// the FIFO. The group-shared kernel holds one state block per head in each state CB and relies on
+// every head running the identical push/pop sequence per chunk to get its own block back at the front;
+// where an in-place helper (mul_block_inplace, mul_block_bcast_cols) rotates the block away mid-step
+// and a later read still expects it at the front, this closes the ring back up (H - 1 more blocks).
+ALWI void palu_rotate_blocks(uint32_t cb_id, uint32_t tiles, uint32_t blocks) {
+    CircularBuffer cb(cb_id);
+    for (uint32_t i = 0; i < blocks; ++i) {
+        cb.wait_front(tiles);
+        cb.pop_front(tiles);
+        cb.reserve_back(tiles);
+        cb.push_back(tiles);
+    }
 }
 
 // ---------------- Phase 2: the query state (spec §5) ----------------
@@ -170,8 +194,17 @@ ALWI void palu_step_q() {
 // V_h for one chunk from the V latent and this head's u_v slice, row tile by row tile, packed into
 // cb_v_out in ROW-MAJOR tile order (k * vDHt + n) -- the layout the PV matmul_blocks(..., transpose=false)
 // reads in1 in. u_v tiles sit at uv_tile_base + kt*vDHt + n inside the resident weight block (cb_w, not
-// popped); the V latent rows are popped here.
-template <uint32_t cb_vlat, uint32_t cb_w, uint32_t cb_v_out, uint32_t Rvt, uint32_t vDHt, uint32_t dst_tiles>
+// popped; in group-shared mode the caller adds this head's block base to uv_tile_base). The V latent
+// rows are popped here unless pop_latent is false -- the group-shared caller pops the shared chunk
+// once, after the last head of the core.
+template <
+    uint32_t cb_vlat,
+    uint32_t cb_w,
+    uint32_t cb_v_out,
+    uint32_t Rvt,
+    uint32_t vDHt,
+    uint32_t dst_tiles,
+    bool pop_latent = true>
 ALWI void palu_build_v_chunk(uint32_t Sk_chunk_t, uint32_t uv_tile_base) {
     constexpr uint32_t sub_w = vDHt > dst_tiles ? dst_tiles : vDHt;
     constexpr uint32_t subblocks = vDHt / sub_w;
@@ -201,5 +234,7 @@ ALWI void palu_build_v_chunk(uint32_t Sk_chunk_t, uint32_t uv_tile_base) {
         }
     }
     vo.push_back(Sk_chunk_t * vDHt);
-    vlat.pop_front(Sk_chunk_t * Rvt);
+    if constexpr (pop_latent) {
+        vlat.pop_front(Sk_chunk_t * Rvt);
+    }
 }

@@ -46,6 +46,9 @@ struct PaluSdpaDecodeParams {
     uint32_t heads_per_group = 1;
     // Palu: V rebuilt on core per head from the V latent and u_v (head_dim_v is then 128).
     bool recon_v = false;
+    // Palu stage 2c: KV heads per core. 0 = the stock work split decides. When > 1 (and the latents
+    // are grouped) the kernel runs in group-shared mode: the core's heads read each latent chunk once.
+    uint32_t heads_per_core = 0;
 };
 
 struct PaluSdpaDecodeInputs {

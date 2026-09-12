@@ -23,6 +23,7 @@ ttnn::Tensor palu_sdpa_decode(
     const std::optional<const Tensor>& rot_step = std::nullopt,   // [1, 1, 32, 256] fp32 -> Phase 2
     const std::optional<const Tensor>& trans_mat = std::nullopt,  // [1, 1, 32, 32] bf16 (Phase 2)
     const std::optional<const Tensor>& u_v = std::nullopt,        // [1, n_kv, r_v_g, 128] bf16 (optional) -> in-kernel V reconstruction
+    std::optional<uint32_t> heads_per_core = std::nullopt,        // KV heads per core (None = the stock work split)
     std::optional<float> scale = std::nullopt,
     const std::optional<MemoryConfig>& memory_config = std::nullopt,
     std::optional<operations::transformer::SDPAProgramConfig> program_config = std::nullopt,

@@ -219,6 +219,26 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     while (num_kv_heads % num_heads_per_core != 0) {
         num_heads_per_core++;
     }
+    // Palu stage 2c: the caller can pin how many KV heads a core owns (0 = the stock rule above).
+    // With grouped latents and more than one head per core the program runs in group-shared mode:
+    // the core's heads all sit in one latent group, so the reader reads each latent chunk once and
+    // every head rebuilds its own K (and V) from it (spec 2026-09-12-palu-tt-stage2c-design.md §3.2).
+    if (operation_attributes.heads_per_core != 0) {
+        num_heads_per_core = operation_attributes.heads_per_core;
+        TT_FATAL(
+            num_kv_heads % num_heads_per_core == 0 && heads_per_group % num_heads_per_core == 0,
+            "palu_sdpa_decode: heads_per_core={} must divide both the KV head count ({}) and "
+            "heads_per_group ({}) so a core's heads are contiguous inside one latent group",
+            num_heads_per_core,
+            num_kv_heads,
+            heads_per_group);
+    }
+    // Group-shared is opt-in: the stock rule already hands a core two heads at batch 32, but the mode
+    // keeps H weight blocks resident (772 KB at the 512/512 layer) and H flash states, which that split
+    // never budgeted for -- turning it on implicitly would blow L1 on the widest layers. The host picks
+    // H from an L1 estimate in stage 2c task 2; until then only an explicit heads_per_core selects it.
+    const bool group_shared = heads_per_group > 1 && operation_attributes.heads_per_core > 1;
+    const uint32_t H = group_shared ? num_heads_per_core : 1;  // state/weight blocks resident per core
     const uint32_t num_cores_per_batch = num_cores_per_head * num_kv_heads / num_heads_per_core;
     const uint32_t num_reducer_cores = num_kv_heads * B / num_heads_per_core;
     const uint32_t num_output_cores = B;
@@ -264,6 +284,24 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
         (num_cores_per_head >= 1 && num_heads_per_core == 1) || (num_cores_per_head == 1 && num_heads_per_core >= 1),
         "Invalid core assignment: cores_per_head={}, heads_per_core={}",
         num_cores_per_head,
+        num_heads_per_core);
+    // A pinned heads_per_core changes the item count, so the layout can outgrow the grid (e.g. batch 32
+    // with heads_per_core=1 wants 128 single-head items on 64 cores, which is why the stock rule picks 2).
+    TT_FATAL(
+        num_active_cores <= num_cores_available,
+        "palu_sdpa_decode: heads_per_core={} needs {} cores (batch {} x {} KV heads / {} x {} cores per "
+        "head), only {} available",
+        num_heads_per_core,
+        num_active_cores,
+        B,
+        num_kv_heads,
+        num_heads_per_core,
+        num_cores_per_head,
+        num_cores_available);
+    TT_FATAL(
+        !group_shared || recon_v,
+        "palu_sdpa_decode: group-shared mode (heads_per_core={}) rebuilds V per head on core, so u_v "
+        "is required",
         num_heads_per_core);
 
     // ========== Group Indexing Mode ==========
@@ -506,6 +544,12 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     log_debug(tt::LogOp, "Tree reduction: {} rounds", num_tree_reduction_rounds);
     log_debug(
         tt::LogOp,
+        "Palu: heads_per_group={}, heads_per_core={}, group_shared={}",
+        heads_per_group,
+        num_heads_per_core,
+        group_shared);
+    log_debug(
+        tt::LogOp,
         "Flags: paged={}, q_sharded={}, q_local={}, mask={}, sink={}, half_tile={}",
         is_paged_attention,
         is_q_sharded,
@@ -621,7 +665,9 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     // Stage 2b: u_v rides in the same per-head block ([w_rot | u_v | T]); above r_k 128 or in the V mode
     // the block is too big to double-buffer, so the CB holds exactly one block (still a whole number).
     const uint32_t w_rot_block = Rt * Wt + (recon_v ? Rvt * DHt : 0) + (phase2 ? 1 : 0);
-    const uint32_t w_rot_tiles = (Rt > 4 || recon_v) ? w_rot_block : 2 * w_rot_block;
+    // Group-shared: all H blocks stay resident for the whole run (the compute indexes block h from the
+    // CB base), so the CB is exactly H whole blocks and there is no prefetch slot.
+    const uint32_t w_rot_tiles = group_shared ? H * w_rot_block : ((Rt > 4 || recon_v) ? w_rot_block : 2 * w_rot_block);
     const uint32_t ab_tiles = 2 * Wt;                                                         // one AB row block, ping-pong
     const uint32_t cs_tiles = phase2 ? Sk_chunk_t_cb_size * Wt : 2 * Sk_chunk_t_cb_size * Wt;  // resident table / streamed x2
     // The reader pushes each of these CBs in one linear block per head/chunk (never wrapping mid-push),
@@ -629,10 +675,12 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     // block instead of back at a block boundary. w_rot's granule is one head's block (w_rot_block); the
     // latent chunk's and the cs table's granule is one chunk (Sk_chunk_t_cb_size * Rt / * Wt).
     TT_FATAL(
-        w_rot_tiles % w_rot_block == 0 && lat_tiles % (Sk_chunk_t_cb_size * Rt) == 0 &&
-            cs_tiles % (Sk_chunk_t_cb_size * Wt) == 0,
-        "palu_sdpa_decode: Palu CB sizes must be a whole number of reader push blocks (w_rot_tiles={} "
-        "w_rot_block={}, lat_tiles={} chunk={}, cs_tiles={} chunk={})",
+        w_rot_tiles % w_rot_block == 0 && w_rot_tiles / w_rot_block >= H &&
+            lat_tiles % (Sk_chunk_t_cb_size * Rt) == 0 && cs_tiles % (Sk_chunk_t_cb_size * Wt) == 0,
+        "palu_sdpa_decode: Palu CB sizes must be a whole number of reader push blocks, and c_4 must hold "
+        "the H={} resident weight blocks (w_rot_tiles={} w_rot_block={}, lat_tiles={} chunk={}, "
+        "cs_tiles={} chunk={})",
+        H,
         w_rot_tiles,
         w_rot_block,
         lat_tiles,
@@ -664,17 +712,20 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     }
 
     // Intermediate CBs
+    // Group-shared: the flash state of the H heads a core owns lives in these CBs as H whole blocks
+    // that rotate through the FIFO, one block per head per chunk, so every one of them is H x its
+    // per-head size. (c_24 is consumed inside a head's chunk step and stays one block.)
     add_cb(CBIndex::c_24, qk_tiles * im_tile_size, im_df, im_tile_size, &im_tile);
-    add_cb(CBIndex::c_25, out_tiles * im_tile_size, im_df, im_tile_size, &im_tile);
-    add_cb(CBIndex::c_26, out_tiles * im_tile_size, im_df, im_tile_size, &im_tile);
-    add_cb(CBIndex::c_27, statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
-    add_cb(CBIndex::c_28, statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
-    add_cb(CBIndex::c_29, statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
-    add_cb(CBIndex::c_30, statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
-    add_cb(CBIndex::c_31, statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
-    add_cb(CBIndex::c_21, statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
-    add_cb(CBIndex::c_22, statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
-    add_cb(CBIndex::c_23, out_tiles * im_tile_size, im_df, im_tile_size, &im_tile);
+    add_cb(CBIndex::c_25, H * out_tiles * im_tile_size, im_df, im_tile_size, &im_tile);
+    add_cb(CBIndex::c_26, H * out_tiles * im_tile_size, im_df, im_tile_size, &im_tile);
+    add_cb(CBIndex::c_27, H * statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
+    add_cb(CBIndex::c_28, H * statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
+    add_cb(CBIndex::c_29, H * statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
+    add_cb(CBIndex::c_30, H * statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
+    add_cb(CBIndex::c_31, H * statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
+    add_cb(CBIndex::c_21, H * statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
+    add_cb(CBIndex::c_22, H * statistics_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
+    add_cb(CBIndex::c_23, H * out_tiles * im_tile_size, im_df, im_tile_size, &im_tile);
 
     // Output CBs
     add_cb(CBIndex::c_16, out_tiles * stats_tile_size, stats_df, stats_tile_size, &stats_tile);
@@ -863,6 +914,9 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     if (recon_v) {
         compute_defines["PALU_RECON_V"] = "1";
     }
+    if (group_shared) {
+        compute_defines["PALU_GROUP_SHARED"] = "1";
+    }
 
     if (Sk_chunk_t > 0) {
         auto add_granularity = [&](const char* name, uint32_t value) {
@@ -887,11 +941,17 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     // ========== Kernel Creation ==========
     const std::string kernel_path = "ttnn/cpp/ttnn/operations/transformer/palu_sdpa_decode/device/kernels/";
 
+    KernelDescriptor::Defines dataflow_defines;
+    if (group_shared) {
+        dataflow_defines.emplace_back("PALU_GROUP_SHARED", "1");
+    }
+
     KernelDescriptor reader_desc;
     reader_desc.kernel_source = kernel_path + "dataflow/palu_reader_decode.cpp";
     reader_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
     reader_desc.core_ranges = core_grid;
     reader_desc.compile_time_args = std::move(reader_compile_time_args_common);
+    reader_desc.defines = dataflow_defines;
     reader_desc.config = ReaderConfigDescriptor{};
 
     KernelDescriptor writer_desc;
@@ -899,6 +959,7 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     writer_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
     writer_desc.core_ranges = core_grid;
     writer_desc.compile_time_args = std::move(writer_compile_time_args_common);
+    writer_desc.defines = dataflow_defines;
     writer_desc.config = WriterConfigDescriptor{};
 
     KernelDescriptor compute_desc;
