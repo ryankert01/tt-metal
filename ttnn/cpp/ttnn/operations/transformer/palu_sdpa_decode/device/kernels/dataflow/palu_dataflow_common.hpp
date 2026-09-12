@@ -57,10 +57,12 @@ void read_w_rot(uint32_t head, const ReaderT& reader, const UvReaderT& u_v_reade
 
 // Per K chunk, in this order: the latent rows [Sk_chunk_t x Rt] (contiguous in DRAM), the absolute
 // [cos | sin] rows for the same positions [Sk_chunk_t x Wt] (Phase 1 only; Phase 2 uses a resident
-// chunk-relative table read once by the caller), then V [Sk_chunk_t x vDHt] exactly as stock.
+// chunk-relative table read once by the caller), then V [Sk_chunk_t x v_width_t]. v_width_t is the V
+// row width actually stored per position in DRAM: the V head dim (DHt) on the absorbed-V path, or the
+// V latent's own width (Rvt) when V is rebuilt on core from u_v (G-LRD groups the latent, not DHt).
 template <
     uint32_t Rt,
-    uint32_t vDHt,
+    uint32_t v_width_t,
     uint32_t Wt,
     uint32_t barrier_threshold,
     uint32_t cb_lat,
@@ -80,7 +82,7 @@ void read_palu_chunks(
     const VReaderT& v_reader,
     const CsReaderT& cs_reader) {
     const uint32_t lat_chunk_tiles = Sk_chunk_t * Rt;
-    const uint32_t v_chunk_tiles = Sk_chunk_t * vDHt;
+    const uint32_t v_chunk_tiles = Sk_chunk_t * v_width_t;
     const uint32_t cs_chunk_tiles = Sk_chunk_t * Wt;
     for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
         palu_read_tiles<cb_lat, barrier_threshold>(lat_start_tile_id, lat_chunk_tiles, lat_reader);

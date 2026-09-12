@@ -399,6 +399,8 @@ void kernel_main() {
             const uint32_t v_start_tile_id = v_batch_offset + v_head_offset + k_chunk_start * Sk_chunk_t_dynamic * Rvt;
             read_w_rot<cb_w_rot, Rt, Wt, Rvt, DHt, barrier_threshold, phase2, recon_v>(
                 cur_head, w_rot_reader, u_v_reader, trans_mat_reader);
+            // read_palu_chunks's v_width_t is the V row width in DRAM: here it's Rvt (the V latent's own
+            // width), not vDHt (the compile-time V head dim used by the stock paged-attention path above).
             read_palu_chunks<Rt, Rvt, Wt, barrier_threshold, cb_lat_in, cb_v_in, cb_cs_in, phase2>(
                 k_chunk_start, k_chunk_end, lat_start_tile_id, v_start_tile_id, Sk_chunk_t_dynamic,
                 k_reader, v_reader, cs_reader);

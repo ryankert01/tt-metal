@@ -63,12 +63,15 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
         if (tensor_args.v.has_value()) {
             if (operation_attributes.recon_v) {
                 // Palu in-kernel V: c_2 holds the V latent, whose width is u_v's row count; the output
-                // width head_dim_v (128) is u_v's column count instead.
+                // width head_dim_v (128) is u_v's column count instead. Checked on the logical widths
+                // (as r_k_logical is below) so a tile-padded V latent cannot slip through.
+                const uint32_t v_lat_width_logical = input_tensors.at(2).logical_shape()[-1];
+                const uint32_t u_v_rows_logical = tensor_args.u_v->logical_shape()[2];
                 TT_FATAL(
-                    v_shape[3] == tensor_args.u_v->padded_shape()[2],
+                    v_lat_width_logical == u_v_rows_logical,
                     "palu_sdpa_decode: V latent width ({}) must equal u_v rows ({})",
-                    v_shape[3],
-                    tensor_args.u_v->padded_shape()[2]);
+                    v_lat_width_logical,
+                    u_v_rows_logical);
             } else {
                 TT_FATAL(
                     v_shape[3] == operation_attributes.head_dim_v.value(),
@@ -419,7 +422,16 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
         "Flash decode expects K and V to have same number of heads, but got {} and {}",
         k_shape[1],
         v_shape[1]);
-    bool is_gqa = (k_shape[1] > 1);
+    // Palu G-LRD: the number of KV heads that GQA reasons about is w_rot's head count (n_kv), not the
+    // number of latent groups (k_shape[1]) -- a grouped latent cache still expands to n_kv heads via
+    // heads_per_group before attention, so GQA (and Q's head count) must be checked against n_kv.
+    const uint32_t n_kv_heads = tensor_args.w_rot.padded_shape()[1];
+    TT_FATAL(
+        n_kv_heads % k_shape[1] == 0,
+        "palu_sdpa_decode: w_rot heads ({}) must be a multiple of the latent heads ({})",
+        n_kv_heads,
+        k_shape[1]);
+    bool is_gqa = (n_kv_heads > 1);
     if (is_gqa) {
         TT_FATAL(!operation_attributes.output_mem_config.is_sharded(), "Sharded output not supported for GQA");
         TT_FATAL(
@@ -427,10 +439,10 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
             "GQA expects BFLOAT16 input tensor, but got {}",
             input_tensors.at(0).dtype());
         TT_FATAL(
-            q_shape_unpadded[2] % k_shape[1] == 0,
+            q_shape_unpadded[2] % n_kv_heads == 0,
             "GQA expects Q to have a multiple of K heads, but got {} and {}",
             q_shape_unpadded[2],
-            k_shape[1]);
+            n_kv_heads);
     }
 
     // Check attention sink
@@ -485,7 +497,7 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
             i++;
         }
     };
-    const uint32_t n_kv = tensor_args.w_rot.padded_shape()[1];
+    const uint32_t n_kv = n_kv_heads;  // same quantity as the GQA check above (w_rot's head count)
     const uint32_t hpg = operation_attributes.heads_per_group;
     TT_FATAL(
         hpg >= 1 && n_kv == hpg * k_shape[1],

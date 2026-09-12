@@ -32,14 +32,14 @@ void bind_palu_sdpa_decode(nb::module_& mod) {
         | Tensor              | Shape                          | dtype   | Notes                                    |
         +=====================+================================+=========+==========================================+
         | input_tensor_q      | [1, B, n_q_pad, 128]           | bf16    | already RoPE'd, TILE layout              |
-        | k_latent            | [B, n_kv, max_seq_len, r_k]    | bf16    | r_k in {32, 64, 96}                      |
+        | k_latent            | [B, n_groups, max_seq_len, r_k]| bf16    | r_k a multiple of 32 in 32..512          |
         | w_rot               | [1, n_kv, r_k, 256]            | bf16    | [u_k | u_k * T] per KV head              |
         | cs_tab              | [1, 1, >= max_seq_len, 256]    | bf16    | [cos | sin] per position, interleaved    |
-        | v_latent            | [B, n_kv, max_seq_len, r_v]    | bf16    | as for flash_multi_latent_attention_decode|
+        | v_latent            | [B, n_groups, max_seq_len, r_v]| bf16    | as for flash_multi_latent_attention_decode|
         | cur_pos_tensor      | [B]                            | int32   | current position per batch row           |
         | rot_step (optional) | [1, 1, 32, 256]                | fp32    | [cos(c f) | sin(c f)]; selects Phase 2   |
         | trans_mat (optional)| [1, 1, 32, 32]                 | bf16    | required with rot_step (Phase 2)         |
-        | u_v (optional)      | [1, n_kv, r_v, 128]            | bf16    | selects in-kernel V reconstruction       |
+        | u_v (optional)      | [1, n_kv, r_v_g, 128]          | bf16    | selects in-kernel V reconstruction       |
         +---------------------+--------------------------------+---------+------------------------------------------+
 
         Grouped latents (G-LRD, stage 2b): k_latent/v_latent may carry n_kv / heads_per_group heads;
