@@ -72,7 +72,9 @@ void kernel_main() {
     constexpr uint32_t num_tree_reduction_rounds = get_compile_time_arg_val(30);
     constexpr uint32_t original_block_size = get_compile_time_arg_val(31);
     // ---------------- Palu (stage 2) ----------------
-    constexpr uint32_t Rt = get_compile_time_arg_val(32);  // latent width in tiles
+    constexpr uint32_t Rt = get_compile_time_arg_val(32);        // latent width in tiles
+    constexpr bool recon_v = get_compile_time_arg_val(33) == 1;  // V rebuilt on core from u_v
+    constexpr uint32_t Rvt = get_compile_time_arg_val(34);       // V latent width in tiles
     constexpr uint32_t Wt = 2 * DHt;
     constexpr bool has_block_padding = original_block_size > 0 && original_block_size < 32;
 
@@ -133,11 +135,18 @@ void kernel_main() {
     constexpr uint32_t cb_rot_step = tt::CBIndex::c_14;  // Phase 2: [cos(c f) | sin(c f)], fp32
 #ifdef PALU_PHASE2
     constexpr uint32_t cb_q_src = cb_qrot;  // QK reads the on-core rotated query
-    constexpr uint32_t w_rot_cb_tiles = Rt * Wt + 1;  // ... + the trans_mat tile, in the same block
+#define PALU_HAS_PHASE2 1
 #else
     constexpr uint32_t cb_q_src = cb_q_in;
-    constexpr uint32_t w_rot_cb_tiles = Rt * Wt;
+#define PALU_HAS_PHASE2 0
 #endif
+    // The per-head resident weight block in c_4 is [w_rot | u_v (in-kernel V) | trans_mat (Phase 2)];
+    // the reader pushes it as ONE block, so these offsets and the total must match read_w_rot exactly.
+    constexpr uint32_t uv_tile_base = Rt * Wt;                            // u_v follows w_rot in the block
+    constexpr uint32_t t_tile_idx = uv_tile_base + (recon_v ? Rvt * DHt : 0);  // trans_mat is last
+    constexpr uint32_t w_rot_cb_tiles = t_tile_idx + (PALU_HAS_PHASE2 ? 1 : 0);
+    // In the V mode the rebuilt V takes c_1 (the QK matmul has already popped K_rot out of it).
+    constexpr uint32_t cb_v_src = recon_v ? cb_k_in : cb_v_in;
 
     // Runtime arguments
     uint32_t arg_idx = 0;
@@ -320,7 +329,7 @@ void kernel_main() {
 #ifdef PALU_PHASE2
         // q~ = q R_{-k_chunk_start * c}: seed [q | q T] from Q, then one R_{-c} step per chunk this
         // core skips (cores that own a later slice of the context start at their first chunk).
-        palu_init_q_state<cb_q_in, cb_qrot, cb_w_rot, q_chunk_tiles, w_rot_cb_tiles>(Rt * Wt);
+        palu_init_q_state<cb_q_in, cb_qrot, cb_w_rot, q_chunk_tiles, w_rot_cb_tiles>(t_tile_idx);
         for (uint32_t s = 0; s < k_chunk_start; ++s) {
             palu_step_q<cb_qrot, cb_rot_step, DHt, Sq_chunk_t>();
         }
@@ -502,12 +511,17 @@ void kernel_main() {
                 reduce_c<PoolType::SUM, ReduceDim::REDUCE_ROW, cb_qk_im, cb_identity_scale_in, Sq_chunk_t, vector_mode>(
                     cb_cur_sum, cb_cur_sum, Sk_chunk_t_dynamic, false);
 
+#ifdef PALU_RECON_V
+                // V_h for this chunk: the QK matmul above has consumed cb_k_in, so the rebuilt V takes its slot
+                palu_build_v_chunk<cb_v_in, cb_w_rot, cb_k_in, Rvt, vDHt, PALU_DST_TILES>(
+                    Sk_chunk_t_dynamic, uv_tile_base);
+#endif
                 /* OUT_IM = QK @ V_CHUNK */
-                reconfig_data_format(cb_v_in, cb_qk_im);  // DEBUG
+                reconfig_data_format(cb_v_src, cb_qk_im);  // DEBUG
                 pack_reconfig_data_format(cb_out_im);
                 matmul_blocks(
                     cb_qk_im,
-                    cb_v_in,
+                    cb_v_src,
                     cb_out_mm,
                     Sq_chunk_t,
                     vDHt,

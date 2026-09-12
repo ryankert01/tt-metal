@@ -35,16 +35,20 @@ void palu_read_tiles(uint32_t first_tile, uint32_t n, const ReaderT& reader) {
     cb.push_back(n);
 }
 
-// w_rot for one KV head: Rt x Wt tiles, row-major in DRAM ([1, n_kv, r_k, 2*hd] TILE), and in Phase 2
-// the single trans_mat tile behind them (block index Rt*Wt). ONE push of the whole block per head: a
-// push writes linearly from the write pointer, so the block -- not Rt*Wt -- is the CB's granule.
-template <uint32_t cb_w, uint32_t Rt, uint32_t Wt, uint32_t barrier_threshold, bool phase2, typename ReaderT,
-          typename TReaderT>
-void read_w_rot(uint32_t head, const ReaderT& reader, const TReaderT& trans_mat_reader) {
-    constexpr uint32_t block = Rt * Wt + (phase2 ? 1 : 0);
+// Per-head resident weight block: [w_rot (Rt x Wt) | u_v (Rvt x DHt, in-kernel V) | trans_mat (1, Phase 2)],
+// ONE push per head (the block is the CB's granule; a push writes linearly and cannot wrap mid-block).
+// w_rot is [1, n_kv, r_k, 2*hd] TILE and u_v [1, n_kv, r_v, hd] TILE, both head-major and row-major within
+// a head. The rotation weight and u_v are per KV head even when the latents are shared by a group.
+template <uint32_t cb_w, uint32_t Rt, uint32_t Wt, uint32_t Rvt, uint32_t DHt, uint32_t barrier_threshold, bool phase2,
+          bool recon_v, typename ReaderT, typename UvReaderT, typename TReaderT>
+void read_w_rot(uint32_t head, const ReaderT& reader, const UvReaderT& u_v_reader, const TReaderT& trans_mat_reader) {
+    constexpr uint32_t block = Rt * Wt + (recon_v ? Rvt * DHt : 0) + (phase2 ? 1 : 0);
     CircularBuffer cb(cb_w);
     cb.reserve_back(block);
     uint32_t wp = palu_read_tiles_at<cb_w, barrier_threshold>(cb.get_write_ptr(), head * Rt * Wt, Rt * Wt, reader);
+    if constexpr (recon_v) {
+        wp = palu_read_tiles_at<cb_w, barrier_threshold>(wp, head * Rvt * DHt, Rvt * DHt, u_v_reader);
+    }
     if constexpr (phase2) {
         palu_read_tiles_at<cb_w, barrier_threshold>(wp, 0, 1, trans_mat_reader);
     }

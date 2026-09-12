@@ -61,18 +61,28 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
     if (use_mla) {
         // Head dim v validation
         if (tensor_args.v.has_value()) {
-            TT_FATAL(
-                v_shape[3] == operation_attributes.head_dim_v.value(),
-                "Head dimension of V must be equal to head_dim_v, got {} and {}",
-                v_shape[3],
-                operation_attributes.head_dim_v.value());
+            if (operation_attributes.recon_v) {
+                // Palu in-kernel V: c_2 holds the V latent, whose width is u_v's row count; the output
+                // width head_dim_v (128) is u_v's column count instead.
+                TT_FATAL(
+                    v_shape[3] == tensor_args.u_v->padded_shape()[2],
+                    "palu_sdpa_decode: V latent width ({}) must equal u_v rows ({})",
+                    v_shape[3],
+                    tensor_args.u_v->padded_shape()[2]);
+            } else {
+                TT_FATAL(
+                    v_shape[3] == operation_attributes.head_dim_v.value(),
+                    "Head dimension of V must be equal to head_dim_v, got {} and {}",
+                    v_shape[3],
+                    operation_attributes.head_dim_v.value());
+            }
         }
         // Palu: K in DRAM is the latent [B, nkv, S, r_k]; the head dim comes from Q, not from K.
         // Checked on the logical width: a 48-wide latent is tile-padded to 64 and would slip through.
         const auto r_k_logical = input_tensors.at(1).logical_shape()[-1];
         TT_FATAL(
-            (r_k_logical == 32 || r_k_logical == 64 || r_k_logical == 96) && k_shape[-1] == r_k_logical,
-            "palu_sdpa_decode: r_k (latent width) must be 32, 64 or 96, got {}",
+            r_k_logical % 32 == 0 && 32 <= r_k_logical && r_k_logical <= 512 && k_shape[-1] == r_k_logical,
+            "palu_sdpa_decode: r_k (latent width) must be a multiple of 32 in 32..512, got {}",
             r_k_logical);
         TT_FATAL(
             operation_attributes.head_dim_v.value() <= q_shape[3],
@@ -462,7 +472,6 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
     TT_FATAL(tensor_args.q.layout() == Layout::TILE, "palu_sdpa_decode: Q must be TILE layout (c_10 is reused)");
     TT_FATAL(q_shape[1] <= 32, "palu_sdpa_decode: batch must be <= 32, got {}", q_shape[1]);
     const uint32_t r_k = k_shape[-1];
-    const uint32_t n_kv = k_shape[1];
     const uint32_t S = k_shape[2];
     const uint32_t D_palu = q_shape[-1];
     auto expect = [](const Tensor& t, const char* name, std::initializer_list<uint32_t> shape, DataType dt) {
@@ -476,7 +485,33 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
             i++;
         }
     };
+    const uint32_t n_kv = tensor_args.w_rot.padded_shape()[1];
+    const uint32_t hpg = operation_attributes.heads_per_group;
+    TT_FATAL(
+        hpg >= 1 && n_kv == hpg * k_shape[1],
+        "palu_sdpa_decode: heads_per_group {} x latent heads {} != w_rot heads {}",
+        hpg,
+        k_shape[1],
+        n_kv);
     expect(tensor_args.w_rot, "w_rot", {1, n_kv, r_k, 2 * D_palu}, DataType::BFLOAT16);
+    if (operation_attributes.recon_v) {
+        expect(*tensor_args.u_v, "u_v", {1, n_kv, v_shape[3], D_palu}, DataType::BFLOAT16);
+        TT_FATAL(
+            operation_attributes.head_dim_v.value() == D_palu,
+            "palu_sdpa_decode: with u_v head_dim_v must be {} (got {})",
+            D_palu,
+            operation_attributes.head_dim_v.value());
+        TT_FATAL(
+            v_shape[3] % 32 == 0 && v_shape[3] <= 512,
+            "palu_sdpa_decode: V latent width must be a multiple of 32 up to 512, got {}",
+            v_shape[3]);
+    } else {
+        TT_FATAL(
+            hpg == 1,
+            "palu_sdpa_decode: grouped latents (heads_per_group {}) need u_v: the absorbed-V path is per "
+            "head only",
+            hpg);
+    }
     expect(tensor_args.cs_tab, "cs_tab", {1, 1, 0, 2 * D_palu}, DataType::BFLOAT16);
     TT_FATAL(tensor_args.cs_tab.padded_shape()[2] >= S, "palu_sdpa_decode: cs_tab has {} rows, cache has {}", tensor_args.cs_tab.padded_shape()[2], S);
     if (operation_attributes.cs_recurrence) {
@@ -562,6 +597,7 @@ Tensor palu_sdpa_decode(
     const Tensor& cur_pos_tensor,
     const std::optional<const Tensor>& rot_step,
     const std::optional<const Tensor>& trans_mat,
+    const std::optional<const Tensor>& u_v,
     uint32_t head_dim_v,
     std::optional<float> scale,
     const tt::tt_metal::MemoryConfig& output_mem_config,
@@ -569,6 +605,14 @@ Tensor palu_sdpa_decode(
     ttnn::DeviceComputeKernelConfig compute_kernel_config,
     uint32_t k_chunk_size) {
     using OperationType = PaluSdpaDecodeDeviceOperation;
+    // Palu G-LRD: the rotation weight is per KV head, the latent cache is per group.
+    const uint32_t n_kv = w_rot.padded_shape()[1];
+    const uint32_t n_groups = k_latent.padded_shape()[1];
+    TT_FATAL(
+        n_groups > 0 && n_kv % n_groups == 0,
+        "palu_sdpa_decode: heads_per_group must be an integer: w_rot has {} heads, k_latent {}",
+        n_kv,
+        n_groups);
     // Stock attributes pinned to the envelope: causal, unpaged, MLA-style separate V, cur_pos from tensor.
     auto operation_attributes = OperationType::operation_attributes_t{
         .is_causal = true,
@@ -586,6 +630,8 @@ Tensor palu_sdpa_decode(
         .paged_cache_geometry = ttnn::operations::transformer::PagedCacheGeometryOverride{},
         .cache_position_modulo = std::nullopt,
         .cs_recurrence = rot_step.has_value(),
+        .heads_per_group = n_kv / n_groups,
+        .recon_v = u_v.has_value(),
     };
     auto tensor_args = OperationType::tensor_args_t{
         .q = input_tensor_q,
@@ -599,6 +645,7 @@ Tensor palu_sdpa_decode(
         .cs_tab = cs_tab,
         .rot_step = rot_step,
         .trans_mat = trans_mat,
+        .u_v = u_v,
     };
     return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }

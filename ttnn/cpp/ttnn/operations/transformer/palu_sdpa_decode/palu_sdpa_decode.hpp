@@ -22,6 +22,7 @@ ttnn::Tensor palu_sdpa_decode(
     const ttnn::Tensor& cur_pos_tensor,          // [B] int32
     const std::optional<const Tensor>& rot_step = std::nullopt,   // [1, 1, 32, 256] fp32 -> Phase 2
     const std::optional<const Tensor>& trans_mat = std::nullopt,  // [1, 1, 32, 32] bf16 (Phase 2)
+    const std::optional<const Tensor>& u_v = std::nullopt,        // [1, nkv, r_v, 128] bf16 -> in-kernel V
     std::optional<float> scale = std::nullopt,
     const std::optional<MemoryConfig>& memory_config = std::nullopt,
     std::optional<operations::transformer::SDPAProgramConfig> program_config = std::nullopt,

@@ -165,3 +165,41 @@ ALWI void palu_step_q() {
     q.push_back(2 * n);
     q.pop_front(2 * n);
 }
+
+// ---------------- In-kernel V (Palu G-LRD, spec §4) ----------------
+// V_h for one chunk from the V latent and this head's u_v slice, row tile by row tile, packed into
+// cb_v_out in ROW-MAJOR tile order (k * vDHt + n) -- the layout the PV matmul_blocks(..., transpose=false)
+// reads in1 in. u_v tiles sit at uv_tile_base + kt*vDHt + n inside the resident weight block (cb_w, not
+// popped); the V latent rows are popped here.
+template <uint32_t cb_vlat, uint32_t cb_w, uint32_t cb_v_out, uint32_t Rvt, uint32_t vDHt, uint32_t dst_tiles>
+ALWI void palu_build_v_chunk(uint32_t Sk_chunk_t, uint32_t uv_tile_base) {
+    constexpr uint32_t sub_w = vDHt > dst_tiles ? dst_tiles : vDHt;
+    constexpr uint32_t subblocks = vDHt / sub_w;
+    CircularBuffer vlat(cb_vlat), w(cb_w), vo(cb_v_out);
+    w.wait_front(uv_tile_base + Rvt * vDHt);
+    vo.reserve_back(Sk_chunk_t * vDHt);
+    reconfig_data_format(cb_w, cb_vlat);  // matmul: in1 -> SrcA, in0 -> SrcB
+    pack_reconfig_data_format(cb_v_out);
+    matmul_block_init(cb_vlat, cb_w, false /*transpose*/, sub_w /*ct_dim*/, 1 /*rt_dim*/, Rvt /*kt_dim*/);
+    for (uint32_t i = 0; i < Sk_chunk_t; ++i) {
+        vlat.wait_front((i + 1) * Rvt);
+        for (uint32_t sub = 0; sub < subblocks; ++sub) {
+            tile_regs_acquire();
+            uint32_t in0_index = i * Rvt;
+            uint32_t in1_index = uv_tile_base + sub * sub_w;
+            for (uint32_t kt = 0; kt < Rvt; ++kt) {
+                matmul_block(cb_vlat, cb_w, in0_index, in1_index, 0, false, sub_w, 1, Rvt);
+                in0_index++;
+                in1_index += vDHt;
+            }
+            tile_regs_commit();
+            tile_regs_wait();
+            for (uint32_t c = 0; c < sub_w; ++c) {
+                pack_tile<true>(c, cb_v_out, i * vDHt + sub * sub_w + c);
+            }
+            tile_regs_release();
+        }
+    }
+    vo.push_back(Sk_chunk_t * vDHt);
+    vlat.pop_front(Sk_chunk_t * Rvt);
+}

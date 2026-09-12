@@ -65,9 +65,12 @@ void kernel_main() {
     // ---------------- Palu (stage 2) ----------------
     constexpr uint32_t Rt = get_compile_time_arg_val(37);       // latent width in tiles
     constexpr bool phase2 = get_compile_time_arg_val(38) == 1;  // chunk-relative rotation (Task 4)
+    constexpr uint32_t heads_per_group = get_compile_time_arg_val(39);  // KV heads sharing one latent (G-LRD)
+    constexpr bool recon_v = get_compile_time_arg_val(40) == 1;         // V rebuilt on core from u_v
+    constexpr uint32_t Rvt = get_compile_time_arg_val(41);              // V latent width in tiles
     constexpr uint32_t Wt = 2 * DHt;
 
-    constexpr auto q_args = TensorAccessorArgs<39>();
+    constexpr auto q_args = TensorAccessorArgs<42>();
     constexpr auto k_args = TensorAccessorArgs<q_args.next_compile_time_args_offset()>();
     constexpr auto v_args = TensorAccessorArgs<k_args.next_compile_time_args_offset()>();
     constexpr auto mask_args = TensorAccessorArgs<v_args.next_compile_time_args_offset()>();
@@ -78,7 +81,8 @@ void kernel_main() {
     constexpr auto cs_args = TensorAccessorArgs<w_rot_args.next_compile_time_args_offset()>();
     constexpr auto rot_step_args = TensorAccessorArgs<cs_args.next_compile_time_args_offset()>();
     constexpr auto trans_mat_args = TensorAccessorArgs<rot_step_args.next_compile_time_args_offset()>();
-    static_assert(trans_mat_args.next_compile_time_args_offset() > 0);  // keeps the arg chain checked
+    constexpr auto u_v_args = TensorAccessorArgs<trans_mat_args.next_compile_time_args_offset()>();
+    static_assert(u_v_args.next_compile_time_args_offset() > 0);  // keeps the arg chain checked
     // The Palu CBs below reuse slots whose stock owners must be compiled out (spec §4); the program
     // factory refuses to build otherwise, and these assert the kernel side of that contract.
     static_assert(!use_attention_sink, "Palu reuses the attention-sink CB (c_4) for w_rot");
@@ -116,6 +120,7 @@ void kernel_main() {
     const uint32_t cs_addr = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t rot_step_addr = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t trans_mat_addr = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t u_v_addr = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t page_table_page_size = get_arg_val<uint32_t>(arg_idx++);
     const bool is_worker = get_arg_val<uint32_t>(arg_idx++) == 0;
     const bool is_output_core = get_arg_val<uint32_t>(arg_idx++) == 1;
@@ -253,6 +258,7 @@ void kernel_main() {
     const auto w_rot_reader = TensorAccessor(w_rot_args, w_rot_addr);
     const auto cs_reader = TensorAccessor(cs_args, cs_addr);
     const auto trans_mat_reader = TensorAccessor(trans_mat_args, trans_mat_addr);
+    const auto u_v_reader = TensorAccessor(u_v_args, u_v_addr);
 
     if constexpr (phase2) {
         // Chunk-relative [cos | sin] rows t = 0..c-1: the first Sk_chunk_t row tiles of cs_tab, and the
@@ -382,14 +388,18 @@ void kernel_main() {
             }
         } else {
             // ---------------- Palu: latent chunks + rotation tables instead of K chunks ----------------
-            const uint32_t lat_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * St * Rt;
-            const uint32_t lat_head_offset = cur_head * St * Rt;
+            // G-LRD: this head's latents live in its group's slice of the cache; the weights stay per head.
+            const uint32_t lat_head = cur_head / heads_per_group;                 // the group's latent
+            const uint32_t n_lat_heads = num_kv_heads / heads_per_group;
+            const uint32_t lat_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * n_lat_heads * St * Rt;
+            const uint32_t lat_head_offset = lat_head * St * Rt;
             const uint32_t lat_start_tile_id = lat_batch_offset + lat_head_offset + k_chunk_start * Sk_chunk_t_dynamic * Rt;
-            const uint32_t v_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * St * vDHt;
-            const uint32_t v_head_offset = cur_head * St * vDHt;
-            const uint32_t v_start_tile_id = v_batch_offset + v_head_offset + k_chunk_start * Sk_chunk_t_dynamic * vDHt;
-            read_w_rot<cb_w_rot, Rt, Wt, barrier_threshold, phase2>(cur_head, w_rot_reader, trans_mat_reader);
-            read_palu_chunks<Rt, vDHt, Wt, barrier_threshold, cb_lat_in, cb_v_in, cb_cs_in, phase2>(
+            const uint32_t v_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * n_lat_heads * St * Rvt;
+            const uint32_t v_head_offset = lat_head * St * Rvt;
+            const uint32_t v_start_tile_id = v_batch_offset + v_head_offset + k_chunk_start * Sk_chunk_t_dynamic * Rvt;
+            read_w_rot<cb_w_rot, Rt, Wt, Rvt, DHt, barrier_threshold, phase2, recon_v>(
+                cur_head, w_rot_reader, u_v_reader, trans_mat_reader);
+            read_palu_chunks<Rt, Rvt, Wt, barrier_threshold, cb_lat_in, cb_v_in, cb_cs_in, phase2>(
                 k_chunk_start, k_chunk_end, lat_start_tile_id, v_start_tile_id, Sk_chunk_t_dynamic,
                 k_reader, v_reader, cs_reader);
         }

@@ -44,6 +44,10 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     const bool phase2 = operation_attributes.cs_recurrence;  // rot_step + trans_mat present (Task 4)
     Buffer* rot_step_buffer = phase2 ? tensor_args.rot_step->buffer() : nullptr;
     Buffer* trans_mat_buffer = phase2 ? tensor_args.trans_mat->buffer() : nullptr;
+    // Palu stage 2b: grouped latents and in-kernel V reconstruction.
+    const bool recon_v = operation_attributes.recon_v;
+    const uint32_t heads_per_group = operation_attributes.heads_per_group;
+    Buffer* u_v_buffer = recon_v ? tensor_args.u_v->buffer() : nullptr;
     const auto& output_tensor = tensor_return_value;
 
     // ========== Operation Attributes ==========
@@ -109,7 +113,9 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     // layer's spec (e.g. Gemma4-26B-A4B sliding kv=8 cache read by a full kv=2
     // layer). The override drives the kernel's per-block stride and head-parallel
     // reduction grid the same way the legacy cache shape did.
-    uint32_t num_kv_heads = apply_geometry_override ? geo.num_kv_heads : k_shape[1];
+    // Palu: the work layout follows the per-head weight; the caches may hold n_kv / heads_per_group
+    // group latents (G-LRD), so the head count comes from w_rot, not from the cache's group dim.
+    uint32_t num_kv_heads = apply_geometry_override ? geo.num_kv_heads : w_rot.padded_shape()[1];
     TT_FATAL(num_kv_heads > 0, "num_kv_heads must be > 0");
     uint32_t num_q_heads = q_shape_unpadded[2];
     uint32_t page_block_size_t = 0;
@@ -170,6 +176,8 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     const uint32_t r_k = k_shape[3];
     const uint32_t Rt = r_k / TILE_WIDTH;   // latent width in tiles
     const uint32_t Wt = 2 * DHt;            // [u_k | u_k T] / [cos | sin] width in tiles
+    const uint32_t r_v_lat = v_shape[3];
+    const uint32_t Rvt = r_v_lat / TILE_WIDTH;  // V latent width in tiles (== vDHt when !recon_v)
 
     // ========== Grid & Core Configuration ==========
     CoreCoord grid_size = program_config.has_value() ? program_config->compute_with_storage_grid_size
@@ -427,8 +435,10 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
 
     // ========== Tile Counts for Circular Buffers ==========
     const uint32_t q_tiles = PNHt * DHt;
-    const uint32_t k_tiles = Sk_chunk_t_cb_size * DHt * 2;   // double buffer
-    const uint32_t v_tiles = Sk_chunk_t_cb_size * vDHt * 2;  // double buffer
+    // c_1 holds K_rot and, in the in-kernel V mode, the rebuilt V afterwards -- both Sk x DHt / vDHt.
+    TT_FATAL(!recon_v || vDHt == DHt, "palu_sdpa_decode: in-kernel V reuses the K_rot CB, so vDHt ({}) must equal DHt ({})", vDHt, DHt);
+    const uint32_t k_tiles = Sk_chunk_t_cb_size * DHt * 2;  // double buffer
+    const uint32_t v_tiles = Sk_chunk_t_cb_size * Rvt * 2;  // double buffer; c_2 holds the V latent
     const uint32_t qk_tiles = PNHt * Sk_chunk_t_cb_size;
     const uint32_t out_tiles = PNHt * vDHt;
     const uint32_t scale_tiles = 1;
@@ -608,8 +618,10 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     // owns several KV heads pushes here once per head and the pointer must land back at the CB base.
     // Hence T rides inside the same single push, and the CB is two whole blocks (prefetch of the next
     // head), never block + 1.
-    const uint32_t w_rot_block = Rt * Wt + (phase2 ? 1 : 0);
-    const uint32_t w_rot_tiles = 2 * w_rot_block;
+    // Stage 2b: u_v rides in the same per-head block ([w_rot | u_v | T]); above r_k 128 or in the V mode
+    // the block is too big to double-buffer, so the CB holds exactly one block (still a whole number).
+    const uint32_t w_rot_block = Rt * Wt + (recon_v ? Rvt * DHt : 0) + (phase2 ? 1 : 0);
+    const uint32_t w_rot_tiles = (Rt > 4 || recon_v) ? w_rot_block : 2 * w_rot_block;
     const uint32_t ab_tiles = 2 * Wt;                                                         // one AB row block, ping-pong
     const uint32_t cs_tiles = phase2 ? Sk_chunk_t_cb_size * Wt : 2 * Sk_chunk_t_cb_size * Wt;  // resident table / streamed x2
     // The reader pushes each of these CBs in one linear block per head/chunk (never wrapping mid-push),
@@ -746,6 +758,9 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
         capacity_t,
         Rt,
         static_cast<uint32_t>(phase2),
+        heads_per_group,
+        static_cast<uint32_t>(recon_v),
+        Rvt,
     };
     tt_metal::TensorAccessorArgs(input_tensor_q.buffer()).append_to(reader_compile_time_args_common);
     tt_metal::TensorAccessorArgs(input_tensor_k.buffer()).append_to(reader_compile_time_args_common);
@@ -764,6 +779,7 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     tt_metal::TensorAccessorArgs(cs_tab.buffer()).append_to(reader_compile_time_args_common);
     tt_metal::TensorAccessorArgs(rot_step_buffer).append_to(reader_compile_time_args_common);
     tt_metal::TensorAccessorArgs(trans_mat_buffer).append_to(reader_compile_time_args_common);
+    tt_metal::TensorAccessorArgs(u_v_buffer).append_to(reader_compile_time_args_common);
 
     std::vector<uint32_t> writer_compile_time_args_common = {
         B,
@@ -831,6 +847,8 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
         num_tree_reduction_rounds,
         original_block_size,
         Rt,
+        static_cast<uint32_t>(recon_v),
+        Rvt,
     };
 
     // ========== Compute Defines ==========
@@ -841,6 +859,9 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     compute_defines["PALU_DST_TILES"] = std::to_string(dst_size);
     if (phase2) {
         compute_defines["PALU_PHASE2"] = "1";
+    }
+    if (recon_v) {
+        compute_defines["PALU_RECON_V"] = "1";
     }
 
     if (Sk_chunk_t > 0) {
@@ -1000,6 +1021,7 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
         reader_rt_args.push_back(cs_tab.buffer());
         reader_rt_args.push_back(rot_step_buffer);
         reader_rt_args.push_back(trans_mat_buffer);
+        reader_rt_args.push_back(u_v_buffer);
         reader_rt_args.push_back(page_table_stick_size);
         reader_rt_args.push_back(static_cast<uint32_t>(do_reduce));
         reader_rt_args.push_back(static_cast<uint32_t>(do_output));
@@ -1085,8 +1107,8 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
 
             // Reader runtime args
             // Base args (20): includes K-mcast args [do_k_mcast, mcast_x, mcast_y0, mcast_y1, num_dests]
-            // +4 Palu buffers (w_rot, cs_tab, rot_step, trans_mat)
-            KernelDescriptor::CoreRuntimeArgs reader_rt_args(24, 0);
+            // +5 Palu buffers (w_rot, cs_tab, rot_step, trans_mat, u_v)
+            KernelDescriptor::CoreRuntimeArgs reader_rt_args(25, 0);
 
             // Writer runtime args - need to match the size with tree reduction params
             // Base args (10) + tree params (6) + children_per_round (PALU_MAX_TREE_REDUCTION_ROUNDS) + group coords

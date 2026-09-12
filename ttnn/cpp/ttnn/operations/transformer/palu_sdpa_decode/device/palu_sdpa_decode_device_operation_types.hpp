@@ -42,6 +42,10 @@ struct PaluSdpaDecodeParams {
     std::optional<uint32_t> cache_position_modulo = std::nullopt;
     // Palu: chunk-relative rotation with the query advanced on core (Phase 2). Set iff rot_step is given.
     bool cs_recurrence = false;
+    // Palu G-LRD: KV heads per shared latent (k_latent/v_latent have n_kv / heads_per_group heads).
+    uint32_t heads_per_group = 1;
+    // Palu: V rebuilt on core per head from the V latent and u_v (head_dim_v is then 128).
+    bool recon_v = false;
 };
 
 struct PaluSdpaDecodeInputs {
@@ -63,6 +67,7 @@ struct PaluSdpaDecodeInputs {
     Tensor cs_tab;                     // [1, 1, S_cs >= S, 2*hd] bf16: [cos | sin] per position
     std::optional<Tensor> rot_step;    // [1, 1, 32, 2*hd] fp32: [cos(c f) | sin(c f)] (Phase 2)
     std::optional<Tensor> trans_mat;   // [1, 1, 32, 32] bf16 pair-rotation tile (Phase 2)
+    std::optional<Tensor> u_v;         // [1, n_kv, r_v_g, 128] bf16 (in-kernel V)
 };
 
 }  // namespace ttnn::prim

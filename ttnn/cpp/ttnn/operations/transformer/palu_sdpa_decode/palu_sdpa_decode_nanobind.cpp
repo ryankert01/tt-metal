@@ -39,10 +39,19 @@ void bind_palu_sdpa_decode(nb::module_& mod) {
         | cur_pos_tensor      | [B]                            | int32   | current position per batch row           |
         | rot_step (optional) | [1, 1, 32, 256]                | fp32    | [cos(c f) | sin(c f)]; selects Phase 2   |
         | trans_mat (optional)| [1, 1, 32, 32]                 | bf16    | required with rot_step (Phase 2)         |
+        | u_v (optional)      | [1, n_kv, r_v, 128]            | bf16    | selects in-kernel V reconstruction       |
         +---------------------+--------------------------------+---------+------------------------------------------+
 
-        Envelope: head_dim 128, batch <= 32, causal, unpaged, no mask / sink / sliding window.
-        Returns [1, B, n_q, head_dim_v].
+        Grouped latents (G-LRD, stage 2b): k_latent/v_latent may carry n_kv / heads_per_group heads;
+        heads_per_group = w_rot.shape[1] / k_latent.shape[1] must be an integer and every KV head of a
+        group rebuilds itself from the shared latent with its own w_rot (and u_v) slice.
+
+        With u_v the V latent is [B, n_groups, max_seq_len, r_v] and V is rebuilt on core per head as
+        v_latent @ u_v[h]; head_dim_v must then be 128. Without u_v the V latent is attended over
+        directly (the absorbed-V path) and its width must equal head_dim_v.
+
+        Envelope: head_dim 128, r_k a multiple of 32 in 32..512, batch <= 32, causal, unpaged,
+        no mask / sink / sliding window. Returns [1, B, n_q, head_dim_v].
         )doc";
 
     ttnn::bind_function<"palu_sdpa_decode", "ttnn.transformer.">(
@@ -59,6 +68,7 @@ void bind_palu_sdpa_decode(nb::module_& mod) {
         nb::kw_only(),
         nb::arg("rot_step") = nb::none(),
         nb::arg("trans_mat") = nb::none(),
+        nb::arg("u_v") = nb::none(),
         nb::arg("scale") = nb::none(),
         nb::arg("memory_config") = nb::none(),
         nb::arg("program_config") = nb::none(),

@@ -4,6 +4,7 @@
 
 #include "palu_sdpa_decode.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <utility>
@@ -46,6 +47,7 @@ ttnn::Tensor palu_sdpa_decode(
     const ttnn::Tensor& cur_pos_tensor,
     const std::optional<const Tensor>& rot_step,
     const std::optional<const Tensor>& trans_mat,
+    const std::optional<const Tensor>& u_v,
     std::optional<float> scale,
     const std::optional<MemoryConfig>& memory_config,
     std::optional<ttnn::operations::transformer::SDPAProgramConfig> program_config,
@@ -70,17 +72,35 @@ ttnn::Tensor palu_sdpa_decode(
             k_chunk_size);
     }
 
-    TT_FATAL(
-        v_latent.padded_shape()[-1] == head_dim_v,
-        "Head dimension of the V tensor must be equal to head_dim_v parameter value, got {} and {}",
-        v_latent.padded_shape()[-1],
-        head_dim_v);
+    if (u_v.has_value()) {
+        TT_FATAL(
+            head_dim_v == 128,
+            "palu_sdpa_decode: with u_v the output width head_dim_v must be 128, got {}",
+            head_dim_v);
+        TT_FATAL(
+            u_v->padded_shape()[2] == v_latent.padded_shape()[-1],
+            "palu_sdpa_decode: u_v rows ({}) must equal the V latent width ({})",
+            u_v->padded_shape()[2],
+            v_latent.padded_shape()[-1]);
+    } else {
+        TT_FATAL(
+            v_latent.padded_shape()[-1] == head_dim_v,
+            "palu_sdpa_decode: without u_v the V latent width ({}) must equal head_dim_v ({})",
+            v_latent.padded_shape()[-1],
+            head_dim_v);
+    }
+    // L1 rule (spec section 4): a wide latent (Rt > 4) or the in-kernel V mode does not fit the default
+    // 512-position chunk next to the stock CBs; take 128 unless the caller pinned a chunk.
+    const bool caller_pinned = program_config.has_value() && program_config.value().k_chunk_size > 0;
+    if (!caller_pinned && (k_latent.padded_shape()[-1] > 128 || u_v.has_value())) {
+        k_chunk_size = std::min<uint32_t>(k_chunk_size, 128);
+    }
     // get chunk size and then pass to sdpa decode as an attribute for prgm cache
     auto kernel_config_val = init_device_compute_kernel_config(
         input_tensor_q.device()->arch(), compute_kernel_config, tt::tt_metal::MathFidelity::HiFi2, true, false, false);
 
     return ttnn::prim::palu_sdpa_decode(
-        input_tensor_q, k_latent, w_rot, cs_tab, v_latent, cur_pos_tensor, rot_step, trans_mat, head_dim_v, scale,
+        input_tensor_q, k_latent, w_rot, cs_tab, v_latent, cur_pos_tensor, rot_step, trans_mat, u_v, head_dim_v, scale,
         memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG), program_config, kernel_config_val, k_chunk_size);
 }
 

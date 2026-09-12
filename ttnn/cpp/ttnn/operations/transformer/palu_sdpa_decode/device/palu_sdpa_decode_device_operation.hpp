@@ -116,6 +116,7 @@ Tensor palu_sdpa_decode(
     const Tensor& cur_pos_tensor,
     const std::optional<const Tensor>& rot_step,
     const std::optional<const Tensor>& trans_mat,
+    const std::optional<const Tensor>& u_v,
     uint32_t head_dim_v,
     std::optional<float> scale,
     const tt::tt_metal::MemoryConfig& output_mem_config,
