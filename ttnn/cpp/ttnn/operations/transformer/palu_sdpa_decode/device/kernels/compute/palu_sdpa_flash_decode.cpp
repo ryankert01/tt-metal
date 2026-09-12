@@ -506,8 +506,9 @@ void kernel_main() {
      * The head's state is *peeled out of the rings first*. c_26 (O), c_28 (m) and c_30 (l) hold one
      * block per head with head h at the front, and this loop pops exactly one block from each, in head
      * order -- the rings are never rotated here. Everything after the peel is the per-head kernel's
-     * reduction and finalize, verbatim, on single-block CBs: no FIFO bookkeeping to get wrong, and the
-     * numbers go through the same helpers in the same order, so head h's result is bit-identical.
+     * reduction and finalize on single-block CBs, with one deliberate difference: the softmax
+     * correction is spelled out with primitives instead of the fused correction_block (see below), so
+     * head h's result is *not* bit-identical to the per-head branch's once a child is merged.
      *
      * The three scratch CBs are the chunk loop's own, provably drained once the loop is over: c_25 held
      * the PV product (and is exactly one O block), c_24 the QK scores, c_10 the AB rows. All three are
@@ -519,11 +520,20 @@ void kernel_main() {
      * two in step. cb_intermed_out is the one exception and IS sized per head (see the program
      * factory): its producer is a *remote* core, which nothing here can back-pressure.
      */
-    constexpr uint32_t cb_o_head = cb_out_im;  // c_25: exactly out_chunk_tiles, i.e. one O block
-    constexpr uint32_t cb_m_head = cb_qk_im;   // c_24
-    constexpr uint32_t cb_l_head = cb_ab;      // c_10
-    static_assert(Sq_chunk_t * Sk_chunk_t >= Sq_chunk_t, "c_24 must hold one statistics block");
-    static_assert(2 * Wt >= Sq_chunk_t, "c_10 must hold one statistics block");
+    constexpr uint32_t cb_o_head = cb_out_im;  // c_25, sized out_tiles by the factory: one O block
+    constexpr uint32_t cb_m_head = cb_qk_im;   // c_24, sized qk_tiles  = Sq_chunk_t * Sk_chunk_t
+    constexpr uint32_t cb_l_head = cb_ab;      // c_10, sized ab_tiles  = 2 * Wt
+    static_assert(qk_chunk_tiles_dynamic >= Sq_chunk_t, "c_24 (qk_tiles) must hold one statistics block");
+    static_assert(2 * Wt >= Sq_chunk_t, "c_10 (ab_tiles) must hold one statistics block");
+
+    // A core that is neither the tree root nor has a parent has nowhere to put a result. The writer
+    // returns early for it, so the loop below would emit H payloads nobody ever consumes and hang on
+    // the second one. Unreachable with the tree tables the factory builds -- a non-root always has a
+    // parent -- but mirror the writer rather than deadlock if that ever changes.
+    if (!is_tree_root && !has_parent) {
+        CircularBuffer(cb_q_in).pop_front(q_chunk_tiles);
+        return;
+    }
 
     for (uint32_t head = 0; head < H; ++head) {
         // Peel head's O, m and l out of the rings (front = head, in head order).
@@ -547,17 +557,29 @@ void kernel_main() {
 
                 // Softmax correction, spelled out with the primitives the flash loop itself uses rather
                 // than the fused correction_block: cur_max = max(m, m_child), the two
-                // exp((m - cur_max) * scale) factors, then l and O rescaled and added.
+                // exp((m - cur_max) * scale) factors, then l and l_child rescaled and added.
                 //
-                // correction_block does exactly this in one dst acquisition (five operands through dst
-                // registers 0..4, fused_max_sub_exp_add_tile), and it is what the per-head branch below
-                // uses -- but in *this* branch it returns the local max as the merged max, which sends
-                // the child's exp factor to zero and drops its contribution entirely. Measured: the op's
-                // output was then the reducer core's own slice, normalised by its own l, to the last bit
-                // (PCC 1.0000 against a host reference over that slice) while the child's l, m and O were
-                // all verified to arrive correctly in c_7 / c_6 / c_16. Why the fused helper misbehaves
-                // here and not in the per-head branch was not established; the primitives below are the
-                // same arithmetic in the same order and cost four extra dst acquisitions per child.
+                // Why not correction_block. It stages five operands through dst registers 0..4 in ONE
+                // acquisition, but this program's dst window is four tiles: dst_size is
+                // fp32_dest_acc_en ? 4 : 8 and Phase 2 forces fp32 dest accumulate (the rotated query is
+                // fp32). In this branch that overflow corrupts the merged max -- it comes back as the
+                // local max, which sends the child's exp factor to zero and drops the child's
+                // contribution entirely (measured: the op returned the reducer core's own slice
+                // normalised by its own l, PCC 1.0000 against a host reference over that slice, while
+                // the child's l, m and O were each verified to arrive correctly in c_7 / c_6 / c_16).
+                // Confirmed as the dst window by two experiments on the same layout, both with the fused
+                // helper in place: dst_full_sync_en = true (8 fp32 dst tiles) gives PCC 0.99997, and
+                // Phase 1 with fp32_dest_acc_en = false (8 tiles) gives 0.99994, while Phase 1 *with*
+                // fp32 accumulate reproduces the 0.334 of the broken case. The per-head branch below
+                // survives the same window in every configuration measured (batch 8 and batch 1 splits
+                // under fp32 accumulate come back at PCC 0.99998 / 0.99935 against the fp32 reference),
+                // so it keeps the fused helper; these primitives are the configuration-independent fix.
+                //
+                // NOT the same precision. correction_block keeps steps 1-6 in fp32 dst across one
+                // acquisition and packs four results; this sequence packs to bf16 after every step --
+                // six extra bf16 quantisations per child merge. Same values to within that, but the last
+                // bits differ, which is why group-shared output cannot be bit-identical to the per-head
+                // output once a child is merged, even on an identical work split.
                 max_block<vector_mode>(cb_m_head, cb_m_in, cb_cur_max, Sq_chunk_t);
                 sub_exp_block<scale_fp32>(cb_m_head, cb_cur_max, cb_exp_max_diff, Sq_chunk_t);
                 sub_exp_block<scale_fp32>(cb_m_in, cb_cur_max, cb_exp_max_diff_2, Sq_chunk_t);
