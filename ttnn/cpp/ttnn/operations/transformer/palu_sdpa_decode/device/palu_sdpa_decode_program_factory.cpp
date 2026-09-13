@@ -1053,6 +1053,43 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     Buffer* attn_mask_buffer = use_attention_mask ? attn_mask.value().buffer() : nullptr;
     Buffer* attention_sink_buffer = use_attention_sink ? attention_sink.value().buffer() : nullptr;
 
+    // ========== Stage 2e: table multicast leaders ==========
+    // Roles come only from the active-core list: for every grid column the active cores are counted and
+    // their y range measured, and the core at the top of that range is the leader that reads the Phase 2
+    // table once and multicasts it to the rest of its column. The multicast rectangle is a solid row
+    // range, so a column whose active cores are not contiguous is rejected rather than written into an
+    // idle core's L1. Active cores fill the grid row-major (core_group[i] = {i % grid_x, i / grid_x}),
+    // so in practice a column's active cores are a prefix from the top and the leader is y == 0.
+    std::vector<uint32_t> column_active(grid_size.x, 0);
+    std::vector<uint32_t> column_y_min(grid_size.x, static_cast<uint32_t>(grid_size.y));
+    std::vector<uint32_t> column_y_max(grid_size.x, 0);
+    if (table_mcast) {
+        // do_k_mcast / mcast_x / mcast_y0 / mcast_y1 / num_dests are one set of reader args; the K
+        // multicast owns them whenever column-major group indexing is on, so the table cannot also.
+        TT_FATAL(
+            !use_col_major_group_indexing,
+            "palu_sdpa_decode: table_mcast cannot run with column-major group indexing (q_heads_parallel_factor "
+            "{} > 1), which already uses the reader's multicast arguments for the K broadcast",
+            q_heads_parallel_factor);
+        for (uint32_t i = 0; i < num_active_cores; ++i) {
+            const uint32_t x = static_cast<uint32_t>(core_group[i].x);
+            const uint32_t y = static_cast<uint32_t>(core_group[i].y);
+            column_active[x] += 1;
+            column_y_min[x] = std::min(column_y_min[x], y);
+            column_y_max[x] = std::max(column_y_max[x], y);
+        }
+        for (uint32_t x = 0; x < grid_size.x; ++x) {
+            TT_FATAL(
+                column_active[x] == 0 || column_active[x] == column_y_max[x] - column_y_min[x] + 1,
+                "palu_sdpa_decode: table_mcast needs the active cores of each grid column to be contiguous; "
+                "column {} has {} active cores spanning y {}..{}",
+                x,
+                column_active[x],
+                column_y_min[x],
+                column_y_max[x]);
+        }
+    }
+
     // ========== Runtime Arguments ==========
     for (uint32_t i = 0; i < num_active_cores; ++i) {
         CoreCoord core = core_group[i];
@@ -1082,6 +1119,19 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
             cur_batch = i / num_cores_per_batch;
             core_num_in_reduce = i % num_cores_per_head;
             core_num_in_output = i % num_cores_per_batch;
+            if (table_mcast) {
+                const uint32_t k = column_active[core.x];
+                num_dests = k > 1 ? k - 1 : 0;
+                do_k_mcast = (static_cast<uint32_t>(core.y) == column_y_min[core.x]);
+                if (num_dests > 0) {
+                    auto phys_start =
+                        device->worker_core_from_logical_core(CoreCoord{core.x, column_y_min[core.x] + 1});
+                    auto phys_end = device->worker_core_from_logical_core(CoreCoord{core.x, column_y_max[core.x]});
+                    mcast_x = phys_start.x;
+                    mcast_y0 = phys_start.y;
+                    mcast_y1 = phys_end.y;
+                }
+            }
         }
         uint32_t worker_id_for_reduce = (num_cores_per_head == 0) ? UINT32_MAX : core_num_in_reduce - 1;
         uint32_t worker_id_for_output = (core_num_in_output == 0) ? UINT32_MAX : core_num_in_output - 1;

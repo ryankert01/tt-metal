@@ -5,6 +5,8 @@
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
 #include "api/dataflow/circular_buffer.h"
+#include "api/dataflow/noc_semaphore.h"
+#include "api/dataflow/endpoints.h"
 #include "api/core_local_mem.h"
 
 // n consecutive DRAM tiles [first_tile, first_tile + n) -> the CB write pointer wp, which is advanced
@@ -93,4 +95,59 @@ void read_palu_chunks(
         palu_read_tiles<cb_v, barrier_threshold>(v_start_tile_id, v_chunk_tiles, v_reader);
         v_start_tile_id += v_chunk_tiles;
     }
+}
+
+// Phase 2 angle table and rot_step, multicast down a grid column (stage 2e). The column's leader reads
+// both from DRAM into its own CB region and writes them to the same L1 addresses on the num_dests
+// cores in the vertical range (x, y0..y1), then bumps their multicast semaphore; the receivers wait
+// for it. Both CBs are empty on every core at this point, so every write pointer is the CB base and
+// the addresses coincide. A core whose column has no other active core (num_dests == 0) reads for
+// itself. Pieces of at most 32 KB per multicast call keep each NoC transaction well inside the
+// hardware's burst limit.
+template <uint32_t cb_cs, uint32_t cb_rs, uint32_t barrier_threshold, typename CsReaderT, typename RsReaderT>
+void palu_read_table_mcast(
+    uint32_t cs_tiles, uint32_t rs_tiles, const CsReaderT& cs_reader, const RsReaderT& rs_reader,
+    bool leader, uint32_t num_dests, uint32_t mcast_x, uint32_t mcast_y0, uint32_t mcast_y1, uint32_t sem_id) {
+    Noc noc;
+    CircularBuffer cs(cb_cs), rs(cb_rs);
+    cs.reserve_back(cs_tiles);
+    rs.reserve_back(rs_tiles);
+    const uint32_t cs_wp = cs.get_write_ptr();
+    const uint32_t rs_wp = rs.get_write_ptr();
+    if (leader || num_dests == 0) {
+        palu_read_tiles_at<cb_cs, barrier_threshold>(cs_wp, 0, cs_tiles, cs_reader);
+        palu_read_tiles_at<cb_rs, barrier_threshold>(rs_wp, 0, rs_tiles, rs_reader);
+        if (num_dests > 0) {
+            auto mcast = [&](uint32_t addr, uint32_t bytes) {
+                constexpr uint32_t piece = 32 * 1024;
+                for (uint32_t off = 0; off < bytes; off += piece) {
+                    const uint32_t n = (bytes - off < piece) ? (bytes - off) : piece;
+                    noc.async_write_multicast(
+                        CoreLocalMem<uint32_t>(addr + off),
+                        MulticastEndpoint{},
+                        n,
+                        num_dests,
+                        {},
+                        {.noc_x_start = mcast_x, .noc_y_start = mcast_y0, .noc_x_end = mcast_x, .noc_y_end = mcast_y1,
+                         .addr = addr + off},
+                        false);
+                }
+            };
+            mcast(cs_wp, cs_tiles * get_tile_size(cb_cs));
+            mcast(rs_wp, rs_tiles * get_tile_size(cb_rs));
+            noc.async_write_barrier();
+            constexpr uint32_t VALID = 1;
+            Semaphore<> sem(sem_id);
+            sem.set(VALID);
+            sem.set_multicast(noc, mcast_x, mcast_y0, mcast_x, mcast_y1, num_dests);
+            noc.async_write_barrier();
+        }
+    } else {
+        Semaphore<> sem(sem_id);
+        sem.wait(1);
+        sem.set(0);
+        noc.async_atomic_barrier();
+    }
+    cs.push_back(cs_tiles);
+    rs.push_back(rs_tiles);
 }

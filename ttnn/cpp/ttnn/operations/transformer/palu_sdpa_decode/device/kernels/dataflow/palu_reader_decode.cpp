@@ -140,6 +140,36 @@ void kernel_main() {
         return;
     }
 
+#ifdef PALU_TABLE_MCAST
+    // ---------------- Phase 2 angle table, multicast per grid column (stage 2e) ----------------
+    // The reader's multicast args (do_k_mcast, mcast_x/y0/y1, num_dests) describe this multicast; the
+    // K multicast they were copied for never runs in the Palu envelope. This sits above every early
+    // exit below -- a skipped batch (cur_pos == -1) and a sequence split that leaves a core no chunk
+    // both return before the K/V loop, and a leader that took one of those exits would leave the
+    // receivers in its column waiting on the semaphore forever. Idle cores (returned just above) are
+    // not in any column's active set, so no leader ever multicasts to one.
+    //
+    // The table is chunk-relative, so its height is the pinned K chunk. A per-core dynamic chunk would
+    // make the leader's and the receivers' tile counts disagree; the op always resolves a chunk, so
+    // Sk_chunk_t is nonzero here.
+    if constexpr (phase2) {
+        static_assert(Sk_chunk_t > 0, "palu_sdpa_decode: table_mcast needs a pinned K chunk");
+        constexpr uint32_t table_barrier_threshold =
+            get_barrier_read_threshold<get_tile_size(cb_q_in), num_cores>();
+        palu_read_table_mcast<cb_cs_in, cb_rot_step, table_barrier_threshold>(
+            Sk_chunk_t * Wt,
+            Wt,
+            TensorAccessor(cs_args, cs_addr),
+            TensorAccessor(rot_step_args, rot_step_addr),
+            do_k_mcast,
+            num_dests,
+            mcast_x,
+            mcast_y0,
+            mcast_y1,
+            k_mcast_semaphore_id);
+    }
+#endif
+
     // Get cur_pos
     constexpr uint32_t cur_pos_base = St * 32 - 1;
     uint32_t cur_pos = cur_pos_base;  // default to non-causal, which we do attention on the entire kv cache. In this
@@ -260,13 +290,17 @@ void kernel_main() {
     const auto trans_mat_reader = TensorAccessor(trans_mat_args, trans_mat_addr);
     const auto u_v_reader = TensorAccessor(u_v_args, u_v_addr);
 
+#ifndef PALU_TABLE_MCAST
     if constexpr (phase2) {
         // Chunk-relative [cos | sin] rows t = 0..c-1: the first Sk_chunk_t row tiles of cs_tab, and the
         // per-chunk rotation constants. Both are read once per core and stay resident for the run.
+        // (stage 2e: with PALU_TABLE_MCAST one core per grid column does this read instead, near the
+        // top of the kernel, and multicasts the result down its column.)
         palu_read_tiles<cb_cs_in, barrier_threshold>(0, Sk_chunk_t_dynamic * Wt, cs_reader);
         const auto rot_step_reader = TensorAccessor(rot_step_args, rot_step_addr);
         palu_read_tiles<cb_rot_step, barrier_threshold>(0, Wt, rot_step_reader);
     }
+#endif
 
     // Read attention sink
     if constexpr (use_attention_sink) {
