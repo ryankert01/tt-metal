@@ -3,6 +3,13 @@
 // CB read pointer. Assumes compute_kernel_hw_startup<SrcOrder::Reverse> already ran (stock does it).
 #pragma once
 #include "api/compute/eltwise_binary_sfpu.h"
+#include "api/compute/pack.h"
+
+// K rebuild mode (stage 2e): 0 legacy (SFPU add in dst), 1 pack (packer L1 accumulate), 2 dst.
+// The program factory always sets it; the default keeps this header standalone-compilable.
+#ifndef PALU_ROT_MODE
+#define PALU_ROT_MODE 0
+#endif
 
 // K_rot for one chunk of Sk_chunk_t row tiles. For each row tile i:
 //   AB_i    = lat_i @ [u_k | u_k T]            (1 x Rt) @ (Rt x Wt) -> Wt tiles into cb_ab
@@ -61,6 +68,30 @@ ALWI void palu_build_k_chunk(uint32_t Sk_chunk_t, uint32_t cs_tile_base, uint32_
         reconfig_data_format(cb_ab, cb_cs);  // eltwise: in0 -> SrcA, in1 -> SrcB
         pack_reconfig_data_format(cb_k);
         mul_init(cb_ab, cb_cs);
+#if PALU_ROT_MODE == 1
+        // pack mode (stage 2e): two column tiles per DST trip, the packer's L1 accumulate does the add.
+        // dst0 = A_j cos_j, dst1 = B_j sin_j, dst2 = A_j+1 cos_j+1, dst3 = B_j+1 sin_j+1; the A products
+        // are packed with accumulate off, the B products onto the same L1 tiles with it on.
+        static_assert(DHt % 2 == 0 && dst_tiles >= 4, "pack mode rotates two column tiles per DST trip");
+        for (uint32_t j = 0; j < DHt; j += 2) {
+            const uint32_t c = cs_tile_base + i * Wt + j;
+            tile_regs_acquire();
+            mul_tiles(cb_ab, cb_cs, j, c, 0);
+            mul_tiles(cb_ab, cb_cs, j + DHt, c + DHt, 1);
+            mul_tiles(cb_ab, cb_cs, j + 1, c + 1, 2);
+            mul_tiles(cb_ab, cb_cs, j + 1 + DHt, c + 1 + DHt, 3);
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_reconfig_l1_acc(0);
+            pack_tile<true>(0, cb_k, j * Sk_chunk_t + i);
+            pack_tile<true>(2, cb_k, (j + 1) * Sk_chunk_t + i);
+            pack_reconfig_l1_acc(1);
+            pack_tile<true>(1, cb_k, j * Sk_chunk_t + i);
+            pack_tile<true>(3, cb_k, (j + 1) * Sk_chunk_t + i);
+            pack_reconfig_l1_acc(0);
+            tile_regs_release();
+        }
+#else
         add_binary_tile_init();
         for (uint32_t j = 0; j < DHt; ++j) {
             const uint32_t c = cs_tile_base + i * Wt + j;
@@ -73,6 +104,7 @@ ALWI void palu_build_k_chunk(uint32_t Sk_chunk_t, uint32_t cs_tile_base, uint32_
             pack_tile<true>(0, cb_k, j * Sk_chunk_t + i);
             tile_regs_release();
         }
+#endif
         ab.pop_front(Wt);
     }
     k.push_back(Sk_chunk_t * DHt);
