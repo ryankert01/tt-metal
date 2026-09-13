@@ -31,15 +31,22 @@ void UpdateKVCacheOperation::validate_on_program_cache_miss(
     TT_FATAL(
         (input_tensor.layout() == Layout::TILE && cache_tensor.layout() == Layout::TILE),
         "Inputs to update_cache must be tilized");
+    // Palu stage 2e: a BFLOAT4_B cache filled from a BFLOAT4_B input is allowed for FILL, which is a
+    // dataflow tile copy (reader + writer, no compute kernel) whose page size follows the tensor's tile
+    // size; the same-dtype requirement below still applies.
+    const bool fill_bfp4 = args.op_type == UpdateCacheOpType::FILL && input_tensor.dtype() == DataType::BFLOAT4_B &&
+                           cache_tensor.dtype() == DataType::BFLOAT4_B;
     TT_FATAL(
-        input_tensor.dtype() == DataType::FLOAT32 || input_tensor.dtype() == DataType::BFLOAT16 ||
+        fill_bfp4 || input_tensor.dtype() == DataType::FLOAT32 || input_tensor.dtype() == DataType::BFLOAT16 ||
             input_tensor.dtype() == DataType::BFLOAT8_B,
-        "Input tensor dtype must be FLOAT32, BFLOAT16, or BFLOAT8_B but got {}",
+        "Input tensor dtype must be FLOAT32, BFLOAT16, or BFLOAT8_B (BFLOAT4_B only for fill_cache into a BFLOAT4_B "
+        "cache) but got {}",
         input_tensor.dtype());
     TT_FATAL(
-        cache_tensor.dtype() == DataType::FLOAT32 || cache_tensor.dtype() == DataType::BFLOAT16 ||
+        fill_bfp4 || cache_tensor.dtype() == DataType::FLOAT32 || cache_tensor.dtype() == DataType::BFLOAT16 ||
             cache_tensor.dtype() == DataType::BFLOAT8_B,
-        "Cache tensor dtype must be FLOAT32, BFLOAT16, or BFLOAT8_B but got {}",
+        "Cache tensor dtype must be FLOAT32, BFLOAT16, or BFLOAT8_B (BFLOAT4_B only for fill_cache from a BFLOAT4_B "
+        "input) but got {}",
         cache_tensor.dtype());
 
     TT_FATAL(
