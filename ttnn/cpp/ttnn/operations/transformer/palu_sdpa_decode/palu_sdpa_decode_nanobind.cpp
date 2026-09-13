@@ -10,6 +10,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/variant.h>
 
@@ -56,6 +57,10 @@ void bind_palu_sdpa_decode(nb::module_& mod) {
         them and each head rebuilds its own K (and V) from it. It must divide both heads_per_group and
         the KV head count, and the resulting layout must still fit the core grid.
 
+        rot_mode (stage 2e): "legacy" (stage 2 rebuild), "pack" (packer L1-accumulate add) or "dst"
+        (matmul into DST with dest-reuse multiplies). table_mcast (stage 2e, Phase 2 only): one core
+        per grid column reads the chunk-relative angle table and multicasts it to the column.
+
         Envelope: head_dim 128, r_k a multiple of 32 in 32..512, batch <= 32, causal, unpaged,
         no mask / sink / sliding window. Returns [1, B, n_q, head_dim_v].
         )doc";
@@ -76,6 +81,8 @@ void bind_palu_sdpa_decode(nb::module_& mod) {
         nb::arg("trans_mat") = nb::none(),
         nb::arg("u_v") = nb::none(),
         nb::arg("heads_per_core") = nb::none(),
+        nb::arg("rot_mode") = "legacy",
+        nb::arg("table_mcast") = false,
         nb::arg("scale") = nb::none(),
         nb::arg("memory_config") = nb::none(),
         nb::arg("program_config") = nb::none(),

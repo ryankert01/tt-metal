@@ -49,6 +49,13 @@ struct PaluSdpaDecodeParams {
     // Palu stage 2c: KV heads per core. 0 = the stock work split decides. When > 1 (and the latents
     // are grouped) the kernel runs in group-shared mode: the core's heads read each latent chunk once.
     uint32_t heads_per_core = 0;
+    // Palu stage 2e: how palu_build_k_chunk rotates one K row tile. 0 = legacy (AB block through
+    // c_10, SFPU add), 1 = pack (packer L1-accumulate add, two column tiles per DST trip), 2 = dst
+    // (matmul into DST, dest-reuse multiplies, packer-accumulate add, no c_10 block).
+    uint32_t rot_mode = 0;
+    // Palu stage 2e: the Phase 2 angle table and rot_step are read by one core per grid column and
+    // multicast to the column's other active cores.
+    bool table_mcast = false;
 };
 
 struct PaluSdpaDecodeInputs {

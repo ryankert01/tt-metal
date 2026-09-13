@@ -119,6 +119,8 @@ Tensor palu_sdpa_decode(
     const std::optional<const Tensor>& u_v,
     uint32_t head_dim_v,
     std::optional<uint32_t> heads_per_core,
+    uint32_t rot_mode,
+    bool table_mcast,
     std::optional<float> scale,
     const tt::tt_metal::MemoryConfig& output_mem_config,
     const std::optional<ttnn::operations::transformer::SDPAProgramConfig>& program_config,

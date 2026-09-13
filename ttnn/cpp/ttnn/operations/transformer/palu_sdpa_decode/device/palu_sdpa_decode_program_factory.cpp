@@ -961,6 +961,15 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     compute_defines["DHT_GRANULARITY"] = std::to_string(dht_granularity);
     compute_defines["LOG2_DHT_GRANULARITY"] = std::to_string(log2_dht_granularity);
     compute_defines["PALU_DST_TILES"] = std::to_string(dst_size);
+    const uint32_t rot_mode = operation_attributes.rot_mode;
+    TT_FATAL(rot_mode <= 2, "palu_sdpa_decode: rot_mode {} out of range", rot_mode);
+    if (rot_mode != 0) {
+        TT_FATAL(Sk_chunk_t > 0, "palu_sdpa_decode: rot_mode {} needs a pinned K chunk", rot_mode);
+        TT_FATAL(DHt % 2 == 0 && dst_size >= 4,
+                 "palu_sdpa_decode: rot_mode {} rotates two column tiles per DST trip (DHt {}, dst_size {})",
+                 rot_mode, DHt, dst_size);
+    }
+    compute_defines["PALU_ROT_MODE"] = std::to_string(rot_mode);
     if (phase2) {
         compute_defines["PALU_PHASE2"] = "1";
     }
@@ -997,6 +1006,10 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     KernelDescriptor::Defines dataflow_defines;
     if (group_shared) {
         dataflow_defines.emplace_back("PALU_GROUP_SHARED", "1");
+    }
+    const bool table_mcast = operation_attributes.table_mcast && phase2;
+    if (table_mcast) {
+        dataflow_defines.emplace_back("PALU_TABLE_MCAST", "1");
     }
 
     KernelDescriptor reader_desc;

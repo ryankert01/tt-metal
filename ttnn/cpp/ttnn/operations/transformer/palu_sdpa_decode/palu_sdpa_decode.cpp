@@ -49,6 +49,8 @@ ttnn::Tensor palu_sdpa_decode(
     const std::optional<const Tensor>& trans_mat,
     const std::optional<const Tensor>& u_v,
     std::optional<uint32_t> heads_per_core,
+    const std::string& rot_mode,
+    bool table_mcast,
     std::optional<float> scale,
     const std::optional<MemoryConfig>& memory_config,
     std::optional<ttnn::operations::transformer::SDPAProgramConfig> program_config,
@@ -100,10 +102,22 @@ ttnn::Tensor palu_sdpa_decode(
     auto kernel_config_val = init_device_compute_kernel_config(
         input_tensor_q.device()->arch(), compute_kernel_config, tt::tt_metal::MathFidelity::HiFi2, true, false, false);
 
+    uint32_t rot_mode_id = 0;
+    if (rot_mode == "legacy") {
+        rot_mode_id = 0;
+    } else if (rot_mode == "pack") {
+        rot_mode_id = 1;
+    } else if (rot_mode == "dst") {
+        rot_mode_id = 2;
+    } else {
+        TT_THROW("palu_sdpa_decode: rot_mode must be legacy, pack or dst, got {}", rot_mode);
+    }
+    TT_FATAL(!table_mcast || rot_step.has_value(), "palu_sdpa_decode: table_mcast needs Phase 2 (rot_step)");
+
     return ttnn::prim::palu_sdpa_decode(
         input_tensor_q, k_latent, w_rot, cs_tab, v_latent, cur_pos_tensor, rot_step, trans_mat, u_v, head_dim_v,
-        heads_per_core, scale, memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG), program_config,
-        kernel_config_val, k_chunk_size);
+        heads_per_core, rot_mode_id, table_mcast, scale, memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG),
+        program_config, kernel_config_val, k_chunk_size);
 }
 
 }  // namespace ttnn::transformer

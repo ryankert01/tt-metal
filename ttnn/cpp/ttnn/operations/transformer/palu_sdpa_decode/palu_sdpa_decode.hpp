@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <string>
+
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/operations/transformer/sdpa_config.hpp"
 #include "ttnn/types.hpp"
@@ -24,6 +26,8 @@ ttnn::Tensor palu_sdpa_decode(
     const std::optional<const Tensor>& trans_mat = std::nullopt,  // [1, 1, 32, 32] bf16 (Phase 2)
     const std::optional<const Tensor>& u_v = std::nullopt,        // [1, n_kv, r_v_g, 128] bf16 (optional) -> in-kernel V reconstruction
     std::optional<uint32_t> heads_per_core = std::nullopt,        // KV heads per core (None = the stock work split)
+    const std::string& rot_mode = "legacy",                       // stage 2e: legacy | pack | dst
+    bool table_mcast = false,                                     // stage 2e: multicast the Phase 2 table per column
     std::optional<float> scale = std::nullopt,
     const std::optional<MemoryConfig>& memory_config = std::nullopt,
     std::optional<operations::transformer::SDPAProgramConfig> program_config = std::nullopt,

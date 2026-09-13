@@ -633,6 +633,8 @@ Tensor palu_sdpa_decode(
     const std::optional<const Tensor>& u_v,
     uint32_t head_dim_v,
     std::optional<uint32_t> heads_per_core,
+    uint32_t rot_mode,
+    bool table_mcast,
     std::optional<float> scale,
     const tt::tt_metal::MemoryConfig& output_mem_config,
     const std::optional<ttnn::operations::transformer::SDPAProgramConfig>& program_config,
@@ -667,6 +669,8 @@ Tensor palu_sdpa_decode(
         .heads_per_group = n_kv / n_groups,
         .recon_v = u_v.has_value(),
         .heads_per_core = heads_per_core.value_or(0),
+        .rot_mode = rot_mode,
+        .table_mcast = table_mcast,
     };
     auto tensor_args = OperationType::tensor_args_t{
         .q = input_tensor_q,
