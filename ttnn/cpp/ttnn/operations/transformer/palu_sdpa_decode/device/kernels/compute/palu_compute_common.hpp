@@ -21,6 +21,8 @@
 // w_block_base (group-shared mode keeps the core's H blocks resident; 0 otherwise). The latent rows
 // are popped here unless pop_latent is false -- the group-shared caller pops the shared chunk once,
 // after the last head of the core has rebuilt its K from it.
+// PALU_ROT_MODE 2 (dst) computes the same K without ever staging AB in L1: the two matmuls land in DST
+// and the cos/sin multiplies read their first operand straight back out of it, so cb_ab is unused.
 template <
     uint32_t cb_lat,
     uint32_t cb_w,
@@ -35,10 +37,12 @@ ALWI void palu_build_k_chunk(uint32_t Sk_chunk_t, uint32_t cs_tile_base, uint32_
     constexpr uint32_t Wt = 2 * DHt;
     constexpr uint32_t ab_w = Wt > dst_tiles ? dst_tiles : Wt;  // output columns per dest acquisition
     constexpr uint32_t ab_subblocks = Wt / ab_w;
-    CircularBuffer lat(cb_lat), w(cb_w), ab(cb_ab), cs(cb_cs), k(cb_k);
+    CircularBuffer lat(cb_lat), w(cb_w), cs(cb_cs), k(cb_k);
+    [[maybe_unused]] CircularBuffer ab(cb_ab);  // rot_mode 2 never stages AB through L1
     w.wait_front(w_block_base + Rt * Wt);
     cs.wait_front(cs_tile_base + Sk_chunk_t * Wt);
     k.reserve_back(Sk_chunk_t * DHt);
+#if PALU_ROT_MODE != 2
     for (uint32_t i = 0; i < Sk_chunk_t; ++i) {
         // ---- AB_i = lat_i @ w_rot ----
         lat.wait_front((i + 1) * Rt);
@@ -107,6 +111,55 @@ ALWI void palu_build_k_chunk(uint32_t Sk_chunk_t, uint32_t cs_tile_base, uint32_
 #endif
         ab.pop_front(Wt);
     }
+#else
+    // dst mode (stage 2e): per row tile i and column-tile pair (j, j+1), one DST trip:
+    //   dst0..1 = lat_i @ w[:, j..j+1]            (the A half)
+    //   dst2..3 = lat_i @ w[:, j+DHt..j+DHt+1]    (the B half)
+    //   dst0..1 *= cos_j, cos_j+1 ; dst2..3 *= sin_j, sin_j+1   (dest-reuse: DST -> SrcA, table -> SrcB)
+    //   pack dst0, dst1 into c_1; pack dst2, dst3 onto the same tiles with L1 accumulate on.
+    // No AB block in L1, no SFPU pass; two trips per row tile.
+    static_assert(DHt % 2 == 0 && dst_tiles >= 4, "dst mode needs four DST tiles: A_j, A_j+1, B_j, B_j+1");
+    pack_reconfig_data_format(cb_k);
+    for (uint32_t i = 0; i < Sk_chunk_t; ++i) {
+        lat.wait_front((i + 1) * Rt);
+        for (uint32_t j = 0; j < DHt; j += 2) {
+            const uint32_t c = cs_tile_base + i * Wt + j;
+            reconfig_data_format(cb_w, cb_lat);  // matmul: in1 -> SrcA, in0 -> SrcB
+            matmul_block_init(cb_lat, cb_w, false /*transpose*/, 2 /*ct_dim*/, 1 /*rt_dim*/, Rt /*kt_dim*/);
+            tile_regs_acquire();
+            uint32_t in0_index = i * Rt;
+            uint32_t in1_index = w_block_base + j;
+            for (uint32_t kt = 0; kt < Rt; ++kt) {          // A_j, A_j+1 -> dst 0, 1
+                matmul_block(cb_lat, cb_w, in0_index, in1_index, 0, false, 2, 1, Rt);
+                in0_index++;
+                in1_index += Wt;
+            }
+            in0_index = i * Rt;
+            in1_index = w_block_base + j + DHt;
+            for (uint32_t kt = 0; kt < Rt; ++kt) {          // B_j, B_j+1 -> dst 2, 3
+                matmul_block(cb_lat, cb_w, in0_index, in1_index, 2, false, 2, 1, Rt);
+                in0_index++;
+                in1_index += Wt;
+            }
+            reconfig_data_format(cb_cs, cb_cs);
+            mul_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_cs);
+            mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_cs, c, 0);
+            mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_cs, c + 1, 1);
+            mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_cs, c + DHt, 2);
+            mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_cs, c + DHt + 1, 3);
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_reconfig_l1_acc(0);
+            pack_tile<true>(0, cb_k, j * Sk_chunk_t + i);
+            pack_tile<true>(1, cb_k, (j + 1) * Sk_chunk_t + i);
+            pack_reconfig_l1_acc(1);
+            pack_tile<true>(2, cb_k, j * Sk_chunk_t + i);
+            pack_tile<true>(3, cb_k, (j + 1) * Sk_chunk_t + i);
+            pack_reconfig_l1_acc(0);
+            tile_regs_release();
+        }
+    }
+#endif
     k.push_back(Sk_chunk_t * DHt);
     if constexpr (pop_latent) {
         lat.pop_front(Sk_chunk_t * Rt);

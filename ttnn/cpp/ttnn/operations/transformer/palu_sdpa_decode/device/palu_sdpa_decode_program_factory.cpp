@@ -718,7 +718,9 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     // Group-shared: all H blocks stay resident for the whole run (the compute indexes block h from the
     // CB base), so the CB is exactly H whole blocks and there is no prefetch slot.
     const uint32_t w_rot_tiles = group_shared ? H * w_rot_block : ((Rt > 4 || recon_v) ? w_rot_block : 2 * w_rot_block);
-    const uint32_t ab_tiles = 2 * Wt;                                                         // one AB row block, ping-pong
+    // rot_mode 2 (dst) never stages AB through c_10; the slot only has to hold one statistics block for
+    // the group-mode peel (cb_l_head), which is PNHt tiles.
+    const uint32_t ab_tiles = operation_attributes.rot_mode == 2 ? PNHt : 2 * Wt;  // one AB row block, ping-pong
     const uint32_t cs_tiles = phase2 ? Sk_chunk_t_cb_size * Wt : 2 * Sk_chunk_t_cb_size * Wt;  // resident table / streamed x2
     // The reader pushes each of these CBs in one linear block per head/chunk (never wrapping mid-push),
     // so every CB must be a whole number of its push granule or the write pointer would land inside a

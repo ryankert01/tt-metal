@@ -523,12 +523,12 @@ void kernel_main() {
      */
     constexpr uint32_t cb_o_head = cb_out_im;  // c_25, sized out_tiles by the factory: one O block
     constexpr uint32_t cb_m_head = cb_qk_im;   // c_24, sized qk_tiles  = Sq_chunk_t * Sk_chunk_t
-    constexpr uint32_t cb_l_head = cb_ab;      // c_10, sized ab_tiles  = 2 * Wt
+    constexpr uint32_t cb_l_head = cb_ab;      // c_10, sized ab_tiles  = 2 * Wt (PNHt in rot_mode 2)
     // c_24 is qk_tiles = Sq_chunk_t * Sk_chunk_t tiles, so one statistics block (Sq_chunk_t) fits as
     // soon as the chunk is pinned -- which the static_assert above already requires. Sized from
     // Sk_chunk_t rather than qk_chunk_tiles_dynamic, which is not constexpr under DYNAMIC_CHUNK_SIZE.
     static_assert(Sk_chunk_t >= 1, "c_24 (qk_tiles = Sq_chunk_t * Sk_chunk_t) must hold one statistics block");
-    static_assert(2 * Wt >= Sq_chunk_t, "c_10 (ab_tiles = 2 * Wt) must hold one statistics block");
+    static_assert(PALU_ROT_MODE == 2 || 2 * Wt >= Sq_chunk_t, "c_10 (ab_tiles = 2 * Wt) must hold one statistics block");
 
     // A core that is neither the tree root nor has a parent has nowhere to put a result. The writer
     // returns early for it, so the loop below would emit H payloads nobody ever consumes and hang on
