@@ -112,11 +112,15 @@ ttnn::Tensor palu_sdpa_decode(
     } else {
         TT_THROW("palu_sdpa_decode: rot_mode must be legacy, pack or dst, got {}", rot_mode);
     }
-    TT_FATAL(!table_mcast || rot_step.has_value(), "palu_sdpa_decode: table_mcast needs Phase 2 (rot_step)");
+    // stage 2e (Task 9): table_mcast ships on, and there is nothing to broadcast in Phase 1 -- the
+    // angle table is streamed per chunk there, not held resident. Fold the switch away instead of
+    // rejecting it, so a Phase 1 caller does not have to opt out of a default it cannot use.
+    const bool table_mcast_eff = table_mcast && rot_step.has_value();
 
     return ttnn::prim::palu_sdpa_decode(
         input_tensor_q, k_latent, w_rot, cs_tab, v_latent, cur_pos_tensor, rot_step, trans_mat, u_v, head_dim_v,
-        heads_per_core, rot_mode_id, table_mcast, scale, memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG),
+        heads_per_core, rot_mode_id, table_mcast_eff, scale,
+        memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG),
         program_config, kernel_config_val, k_chunk_size);
 }
 
