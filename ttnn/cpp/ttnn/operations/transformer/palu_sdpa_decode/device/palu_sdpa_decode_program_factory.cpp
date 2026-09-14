@@ -1071,6 +1071,9 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
             "palu_sdpa_decode: table_mcast cannot run with column-major group indexing (q_heads_parallel_factor "
             "{} > 1), which already uses the reader's multicast arguments for the K broadcast",
             q_heads_parallel_factor);
+        // The per-column bookkeeping below is indexed by core_group[i].x, which on a sub-core grid is a
+        // device column that can run past grid_size.x.
+        TT_FATAL(!on_subcoregrid, "palu_sdpa_decode: table_mcast is not supported on a sub-core grid");
         for (uint32_t i = 0; i < num_active_cores; ++i) {
             const uint32_t x = static_cast<uint32_t>(core_group[i].x);
             const uint32_t y = static_cast<uint32_t>(core_group[i].y);
