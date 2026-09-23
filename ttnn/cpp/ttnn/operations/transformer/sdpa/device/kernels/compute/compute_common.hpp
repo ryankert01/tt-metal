@@ -743,11 +743,12 @@ void correction_block(
     cb_exp_max_diff_obj.reserve_back(num_head_tiles);
     cb_exp_max_diff_2_obj.reserve_back(num_head_tiles);
 
-    constexpr uint32_t dst_reg_0 = 0;  // dst_reg_0 is used for prev_max
-    constexpr uint32_t dst_reg_1 = 1;  // dst_reg_1 is used for worker_max
-    constexpr uint32_t dst_reg_2 = 2;  // dst_reg_2 is used for cur_max
-    constexpr uint32_t dst_reg_3 = 3;  // dst_reg_3 is used for prev_sum, returns cur_sum
-    constexpr uint32_t dst_reg_4 = 4;  // dst_reg_4 is used for worker_sum
+    // Four dst tiles: the SFPU body writes each output over the input it consumed. Four is the whole
+    // budget under fp32_dest_acc_en with DstSync::Half, so no higher index may be used here.
+    constexpr uint32_t dst_reg_0 = 0;  // in: prev_max    out: exp_max_diff
+    constexpr uint32_t dst_reg_1 = 1;  // in: worker_max  out: exp_max_diff_2
+    constexpr uint32_t dst_reg_2 = 2;  // in: prev_sum    out: cur_max
+    constexpr uint32_t dst_reg_3 = 3;  // in: worker_sum  out: cur_sum
 
     // convert scale from fp32 to bf16
     constexpr uint16_t scale_bf16 = scale_fp32 >> 16;
@@ -758,8 +759,8 @@ void correction_block(
         exp_tile_init<EXP_APPROX_MODE>();
         copy_tile(cb_prev_max, i, dst_reg_0);
         copy_tile(cb_worker_max, i, dst_reg_1);
-        copy_tile(cb_prev_sum, i, dst_reg_3);
-        copy_tile(cb_worker_sum, i, dst_reg_4);
+        copy_tile(cb_prev_sum, i, dst_reg_2);
+        copy_tile(cb_worker_sum, i, dst_reg_3);
         MATH((fused_max_sub_exp_add_tile<vector_mode>(0, scale_bf16)));
         tile_regs_commit();
         tile_regs_wait();

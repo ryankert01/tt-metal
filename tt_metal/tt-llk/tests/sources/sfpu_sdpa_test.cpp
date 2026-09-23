@@ -14,14 +14,13 @@
  * of the tile alone. Only column 0 carries meaning for the caller, since these operands are
  * row-reduce outputs broadcast down a column.
  *
- * OP_CORRECTION drives the same skeleton over five DEST tiles instead of one, in the order ttnn's
- * correction_block assigns dst_reg_0..dst_reg_4:
+ * OP_CORRECTION drives the same skeleton over four DEST tiles instead of one, in the order ttnn's
+ * correction_block assigns dst_reg_0..dst_reg_3 (every output overwrites the input it consumed):
  *
  *   tile 0  in: prev_max    out: exp(scale * (prev_max   - cur_max))
  *   tile 1  in: worker_max  out: exp(scale * (worker_max - cur_max))
- *   tile 2  in: ignored     out: cur_max = max(prev_max, worker_max)
- *   tile 3  in: prev_sum    out: exp_worker*worker_sum + exp_prev*prev_sum
- *   tile 4  in: worker_sum  out: exp_worker * worker_sum
+ *   tile 2  in: prev_sum    out: cur_max = max(prev_max, worker_max)
+ *   tile 3  in: worker_sum  out: exp_worker*worker_sum + exp_prev*prev_sum
  */
 
 #include <cstdint>
@@ -49,13 +48,13 @@ constexpr bool SDPA_OP_IS_EXP = (SDPA_OP == OP_EXP_ACCURATE || SDPA_OP == OP_EXP
 
 // Derived from the op rather than passed in, so the tile count cannot disagree with the body.
 // Only the correction body works on more than one tile.
-constexpr std::uint32_t NUM_DST_TILES = (SDPA_OP == OP_CORRECTION) ? 5 : 1;
+constexpr std::uint32_t NUM_DST_TILES = (SDPA_OP == OP_CORRECTION) ? 4 : 1;
 
 static_assert(
     NUM_DST_TILES <= ckernel::get_dest_max_tiles<dest_sync, is_fp32_dest_acc_en, ckernel::DstTileShape::Tile32x32>(),
     "this configuration needs more Dest tiles than the dest_sync / dest_acc pair can hold");
 
-// The dispatch always targets the base tile. The correction body reaches its other four regions
+// The dispatch always targets the base tile. The correction body reaches its other three regions
 // by fixed dst_reg offsets from there.
 constexpr std::uint32_t SDPA_DST_INDEX = 0;
 
@@ -218,7 +217,7 @@ void run_kernel(RUNTIME_PARAMETERS params)
 
     _llk_packer_wait_for_math_done_();
 
-    // Every tile is packed out, since the correction body modifies four of its five regions in place.
+    // Every tile is packed out, since the correction body modifies all four of its regions in place.
     for (std::uint32_t tile = 0; tile < NUM_DST_TILES; ++tile)
     {
         _llk_pack_<dest_sync, is_fp32_dest_acc_en, ckernel::PackMode::Default>(tile, L1_ADDRESS(params.buffer_Res[tile]));

@@ -579,6 +579,12 @@ void kernel_main() {
                 // under fp32 accumulate come back at PCC 0.99998 / 0.99935 against the fp32 reference),
                 // so it keeps the fused helper; these primitives are the configuration-independent fix.
                 //
+                // Update 2026-09-23: the fused helper is fixed in this branch (four dst tiles, every output
+                // written over the input it consumed; see correction_block in compute_common.hpp and
+                // calculate_fused_max_sub_exp_add_tile in ckernel_sfpu_sdpa.h). The "survives" above was
+                // acquisition parity, not design: the old helper was wrong on one of the two dst halves.
+                // These primitives stay so the shipped group-shared numbers do not move.
+                //
                 // NOT the same precision. correction_block keeps steps 1-6 in fp32 dst across one
                 // acquisition and packs four results; this sequence packs to bf16 after every step --
                 // six extra bf16 quantisations per child merge. Same values to within that, but the last

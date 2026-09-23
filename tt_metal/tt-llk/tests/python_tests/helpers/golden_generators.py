@@ -5194,9 +5194,7 @@ class SdpaCorrectionGolden:
     """Golden for calculate_fused_max_sub_exp_add_tile in ckernel_sfpu_sdpa.h."""
 
     def __call__(self, tiles, scale: float):
-        prev_max, worker_max, cur_max_seed, prev_sum, worker_sum = (
-            t.to(torch.float32) for t in tiles
-        )
+        prev_max, worker_max, prev_sum, worker_sum = (t.to(torch.float32) for t in tiles)
 
         cur_max = torch.maximum(prev_max, worker_max)
         exp_prev = torch.exp(scale * (prev_max - cur_max))
@@ -5204,16 +5202,17 @@ class SdpaCorrectionGolden:
         corrected_worker_sum = exp_worker * worker_sum
         corrected_prev_sum = exp_prev * prev_sum
 
+        # Each output overwrites the input tile it consumed: exp_prev over prev_max, exp_worker over
+        # worker_max, cur_max over prev_sum, the corrected sum over worker_sum.
         computed = [
             exp_prev,
             exp_worker,
             cur_max,
             corrected_worker_sum + corrected_prev_sum,
-            corrected_worker_sum,
         ]
 
         cols = torch.tensor(SdpaSfpuGolden.TRANSFORMED_COLS, dtype=torch.long)
-        seeds = [prev_max, worker_max, cur_max_seed, prev_sum, worker_sum]
+        seeds = [prev_max, worker_max, prev_sum, worker_sum]
         out = []
         for seed, value in zip(seeds, computed):
             tile = seed.clone()

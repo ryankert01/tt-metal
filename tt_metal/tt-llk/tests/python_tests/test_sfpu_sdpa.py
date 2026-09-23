@@ -93,8 +93,10 @@ class Precision(Enum):
         return self.label
 
 
-CORRECTION_NUM_TILES = 5
-CORRECTION_TILE_NAMES = ("prev_max", "worker_max", "cur_max", "prev_sum", "worker_sum")
+CORRECTION_NUM_TILES = 4
+CORRECTION_TILE_NAMES = ("prev_max", "worker_max", "prev_sum", "worker_sum")
+# What each tile holds after the body ran: every output overwrites the input it consumed.
+CORRECTION_OUTPUT_NAMES = ("exp_max_diff", "exp_max_diff_2", "cur_max", "cur_sum")
 CORRECTION_SCALE_BF16_VALUES = (0x3F80, 0x3E80)  # (1.0, 0.25)
 
 
@@ -119,7 +121,7 @@ def _ramp(lo: float, hi: float) -> torch.Tensor:
 
 # Most paths that pack into bf16 share one pair because packer rounding is the main source of error.
 # The exceptions are the two paths that are not limited by the rounding precision: correction
-# accumulates across five tiles, and RecipLegacy under APPROX is a 7-bit arecip with no Newton step.
+# accumulates across four tiles, and RecipLegacy under APPROX is a 7-bit arecip with no Newton step.
 _TOLERANCES = {
     # op, approx (None where the body ignores it): bf16-packed, fp32 end-to-end
     (SdpaOp.Correction, None): ((1.5e-4, 2.5e-2), (1.0e-6, 2.5e-7)),
@@ -315,23 +317,19 @@ def test_sfpu_sdpa(variant, precision):
 
 def _correction_stimulus_tiles(torch_format):
     """
-    Five input tiles, chosen so every branch and every in-place write is observable.
+    Four input tiles, chosen so every branch and every in-place write is observable.
 
     prev_max ascends while worker_max descends, so they cross mid-tile and the device's
     `v_if(prev_max < worker_max)` takes both branches within one dispatch. Elements near
     the crossover sit close enough together to exercise a near-tie.
 
-    The cur_max seed sits far below any achievable max. Its output is overwritten
-    unconditionally, so a seed that could coincide with the answer would let a
-    failure-to-write read as a pass.
-
     Both sums are positive and differ from each other, which keeps the two correction
-    products and their sum distinguishable.
+    products and their sum distinguishable. cur_max lands on the prev_sum tile and the
+    sum on the worker_sum tile, so neither seed can coincide with its output.
     """
     tiles = {
         "prev_max": _ramp(-2.0, 2.0),
         "worker_max": _ramp(2.0, -2.0),
-        "cur_max": _ramp(-100.0, -90.0),
         "prev_sum": _ramp(0.5, 4.5),
         "worker_sum": _ramp(4.5, 0.5),
     }
@@ -339,11 +337,13 @@ def _correction_stimulus_tiles(torch_format):
 
 
 def _dest_configurations():
-    """Dest configurations that can hold five tiles."""
+    """Every dest configuration: four tiles fit even the fp32 half-sync window the ttnn SDPA kernels use."""
     return [
         (Precision.Bf16Dest, DestSync.Half),
         (Precision.Bf16Dest, DestSync.Full),
+        (Precision.Fp32Dest, DestSync.Half),
         (Precision.Fp32Dest, DestSync.Full),
+        (Precision.Fp32E2E, DestSync.Half),
         (Precision.Fp32E2E, DestSync.Full),
     ]
 
@@ -410,9 +410,9 @@ def test_sfpu_sdpa_correction(dest_config, scale_bf16):
     ]
 
     for name, src, res, golden in zip(
-        CORRECTION_TILE_NAMES, src_tiles, res_tiles, golden_tiles
+        CORRECTION_OUTPUT_NAMES, src_tiles, res_tiles, golden_tiles
     ):
-        # All five regions are addressed by the same strided walk, so a write outside the
+        # All four regions are addressed by the same strided walk, so a write outside the
         # footprint in any one of them is a stride bug.
         unexpected = _footprint_violations(src.view(TILE_DIM, TILE_DIM), res)
         assert not unexpected, (

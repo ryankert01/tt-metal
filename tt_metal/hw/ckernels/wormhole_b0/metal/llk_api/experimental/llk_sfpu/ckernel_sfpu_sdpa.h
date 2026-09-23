@@ -228,22 +228,33 @@ inline void calculate_exponential_first_column() {
 
 template <bool is_fp32_dest_acc_en>
 inline void calculate_fused_max_sub_exp_add_tile(int scale_bf16) {
+    // Four DEST tiles; every output is written over the input consumed in the same iteration:
+    //   tile 0  in: prev_max    out: exp_max_diff   = exp(scale * (prev_max   - cur_max))
+    //   tile 1  in: worker_max  out: exp_max_diff_2 = exp(scale * (worker_max - cur_max))
+    //   tile 2  in: prev_sum    out: cur_max        = max(prev_max, worker_max)
+    //   tile 3  in: worker_sum  out: cur_sum        = exp_max_diff * prev_sum + exp_max_diff_2 * worker_sum
+    // Four tiles is the whole DEST budget under fp32 accumulation with DstSync::Half, which is how the
+    // ttnn SDPA kernels run; a fifth tile lies outside that window and aliases another tile.
     constexpr int ITERATIONS_HALF_FACE = 4;
     constexpr uint32_t prev_max_base_idx = 0;
     constexpr uint32_t worker_max_base_idx = 32;
-    constexpr uint32_t cur_max_base_idx = 64;
-    constexpr uint32_t prev_sum_base_idx = 96;
-    constexpr uint32_t worker_sum_base_idx = 128;
+    constexpr uint32_t prev_sum_base_idx = 64;
+    constexpr uint32_t worker_sum_base_idx = 96;
+    constexpr uint32_t cur_max_base_idx = prev_sum_base_idx;
+    constexpr uint32_t cur_sum_base_idx = worker_sum_base_idx;
 
     for (int d = 0; d < ITERATIONS_HALF_FACE; d++) {
         sfpi::vFloat prev_max_vec = sfpi::dst_reg[prev_max_base_idx];
         sfpi::vFloat worker_max_vec = sfpi::dst_reg[worker_max_base_idx];
         sfpi::vFloat prev_sum_vec = sfpi::dst_reg[prev_sum_base_idx];
         sfpi::vFloat worker_sum_vec = sfpi::dst_reg[worker_sum_base_idx];
-        v_if(prev_max_vec < worker_max_vec) { sfpi::dst_reg[cur_max_base_idx] = worker_max_vec; }
-        v_else { sfpi::dst_reg[cur_max_base_idx] = prev_max_vec; }
+        sfpi::vFloat cur_max;
+        v_if(prev_max_vec < worker_max_vec) { cur_max = worker_max_vec; }
+        v_else { cur_max = prev_max_vec; }
         v_endif;
-        sfpi::vFloat cur_max = sfpi::dst_reg[cur_max_base_idx];
+        // prev_sum is already in a register, so its tile can take cur_max now; this also keeps cur_max
+        // out of the SFPU register file across the two exp calls (register pressure).
+        sfpi::dst_reg[cur_max_base_idx] = cur_max;
 
         sfpi::vFloat diff_prev = prev_max_vec - cur_max;
         sfpi::vFloat diff_worker = worker_max_vec - cur_max;
@@ -251,18 +262,19 @@ inline void calculate_fused_max_sub_exp_add_tile(int scale_bf16) {
         sfpi::vFloat exp_prev =
             ckernel::sfpu::_ckernel_sfpu_exp_accurate_<true /*SCALE_EN*/, is_fp32_dest_acc_en>(
                 diff_prev, scale_bf16);
+        sfpi::dst_reg[prev_max_base_idx] = exp_prev;
         sfpi::vFloat exp_worker =
             ckernel::sfpu::_ckernel_sfpu_exp_accurate_<true /*SCALE_EN*/, is_fp32_dest_acc_en>(
                 diff_worker, scale_bf16);
-
-        sfpi::dst_reg[prev_max_base_idx] = exp_prev;
         sfpi::dst_reg[worker_max_base_idx] = exp_worker;
 
-        sfpi::dst_reg[worker_sum_base_idx] = exp_worker * worker_sum_vec;
-        sfpi::dst_reg[prev_sum_base_idx] = exp_prev * prev_sum_vec;
-        sfpi::vFloat corr_worker_sum = sfpi::dst_reg[worker_sum_base_idx];
-        sfpi::vFloat corr_prev_sum = sfpi::dst_reg[prev_sum_base_idx];
-        sfpi::dst_reg[prev_sum_base_idx] = corr_worker_sum + corr_prev_sum;
+        // Both products round-trip through DEST (the cur_sum tile, one after the other) so they are
+        // rounded to the DEST format before the add, exactly as before.
+        sfpi::dst_reg[cur_sum_base_idx] = exp_prev * prev_sum_vec;
+        sfpi::vFloat corr_prev_sum = sfpi::dst_reg[cur_sum_base_idx];
+        sfpi::dst_reg[cur_sum_base_idx] = exp_worker * worker_sum_vec;
+        sfpi::vFloat corr_worker_sum = sfpi::dst_reg[cur_sum_base_idx];
+        sfpi::dst_reg[cur_sum_base_idx] = corr_worker_sum + corr_prev_sum;
         sfpi::dst_reg += 2;
     }
 }
