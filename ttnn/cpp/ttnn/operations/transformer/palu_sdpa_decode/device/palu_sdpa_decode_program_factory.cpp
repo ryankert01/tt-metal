@@ -8,6 +8,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <string>
@@ -253,8 +254,14 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
         // the grid idle there -- H = 2 keeps the grid full at that batch.
         // palu_tt.fused.group_heads_per_core models exactly this worst case (4 cores per head, 2 rounds).
         constexpr uint32_t group_max_cores_per_head = 4;
-        num_cores_per_head =
-            std::max(1u, std::min(group_max_cores_per_head, num_cores_per_batch_uncapped / items_per_batch));
+        // Debug override so the hang can be reproduced without a rebuild (report_issue/issue_002 and its
+        // script): PALU_GROUP_MAX_CORES_PER_ITEM raises the cap. Read once per program build, so set it
+        // before the first call in a process. Never set it in production.
+        uint32_t cap = group_max_cores_per_head;
+        if (const char* env = std::getenv("PALU_GROUP_MAX_CORES_PER_ITEM"); env != nullptr && *env != '\0') {
+            cap = std::max(1u, static_cast<uint32_t>(std::strtoul(env, nullptr, 10)));
+        }
+        num_cores_per_head = std::max(1u, std::min(cap, num_cores_per_batch_uncapped / items_per_batch));
     }
     // Group-shared is opt-in: the stock rule already hands a core two heads at batch 32, but the mode
     // keeps H weight blocks resident (772 KB at the 512/512 layer) and H flash states, which that split
