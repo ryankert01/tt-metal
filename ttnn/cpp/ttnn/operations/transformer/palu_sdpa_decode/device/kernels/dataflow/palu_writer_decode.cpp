@@ -73,8 +73,13 @@ void kernel_main() {
     constexpr uint32_t cb_col_identity = tt::CBIndex::c_11;
     constexpr uint32_t cb_sliding_window_mask_in = tt::CBIndex::c_13;  // Separate buffer for sliding window mask
     constexpr uint32_t cb_block_pad_mask = tt::CBIndex::c_14;          // Block padding mask (block_size < TILE_HEIGHT)
-    constexpr uint32_t cb_out_o = tt::CBIndex::c_16;
-    constexpr uint32_t cb_out_worker = tt::CBIndex::c_16;
+    constexpr uint32_t cb_out_o = tt::CBIndex::c_16;       // inbox: a child's O, pushed here, popped by compute
+    constexpr uint32_t cb_out_worker = tt::CBIndex::c_20;  // outbox: this core's O for the parent, pushed by compute
+    // The two directions must not share a CB. The compute side keeps private cumulative tile counts and
+    // stores them into the shared stream registers, while this kernel increments those registers; with
+    // both sides producing and consuming one CB the counts diverge after the first send and the next
+    // child O is never seen by the compute (the group-shared three-round hang, issue 002). c_20 is the
+    // root's output CB, which a non-root core never uses, so it is free to be the outbox here.
     constexpr uint32_t cb_out_m = tt::CBIndex::c_17;
     constexpr uint32_t cb_out_l = tt::CBIndex::c_18;
     constexpr uint32_t cb_intermed_out =

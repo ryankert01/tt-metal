@@ -242,7 +242,9 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
         const uint32_t items_per_batch = num_kv_heads / num_heads_per_core;
         // Cap the split at 4 cores per item, i.e. a two-round reduction tree.
         //
-        // Two reasons. (1) L1: in group-shared mode every core keeps one receive slot per (head, round)
+        // Reason (2) below is fixed (2026-09-24: the hang was c_16 serving as both child-O inbox and
+        // payload outbox, see cb_out_worker in the writer); the cap stays until the 8-core layouts are
+        // re-measured. Two reasons. (1) L1: in group-shared mode every core keeps one receive slot per (head, round)
         // in c_19 (see the intermed sizing below), so that L1 grows with H * rounds and would soon cost
         // more than the larger H buys. (2) Correctness: with three rounds -- eight cores per item, so a
         // reduction node that has two children *and* a parent -- the group-mode reduction deadlocks.
@@ -583,6 +585,14 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
     const uint32_t scalar_tile_size = scalar_tile.get_tile_size(scalar_df);
     const uint32_t im_tile_size = im_tile.get_tile_size(im_df);
     const uint32_t stats_tile_size = stats_tile.get_tile_size(stats_df);
+    // Non-root cores hand their O payload to the writer through c_20 (output format) while the child O
+    // they receive arrives in c_16 (stats format); the parent's receive slot assumes one tile size for
+    // both (see cb_out_worker in the writer for why the two directions cannot share a CB).
+    TT_FATAL(
+        num_cores_per_head == 1 || out_tile_size == stats_tile_size,
+        "palu_sdpa_decode: a split sequence needs the output tile size ({}) to equal the stats tile size ({})",
+        out_tile_size,
+        stats_tile_size);
 
     // ========== Debug Logging ==========
     log_debug(tt::LogOp, "Dimensions: B={}, PNH={}, S={}, DH={}, vDH={}, Bkv={}", B, PNH, S, DH, vDH, Bkv);

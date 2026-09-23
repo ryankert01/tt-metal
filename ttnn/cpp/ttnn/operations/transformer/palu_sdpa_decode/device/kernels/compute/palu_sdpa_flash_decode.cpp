@@ -114,6 +114,13 @@ void kernel_main() {
     constexpr uint32_t cb_out_o = tt::CBIndex::c_16;
     constexpr uint32_t cb_out_m = tt::CBIndex::c_17;
     constexpr uint32_t cb_out_l = tt::CBIndex::c_18;
+    // c_20 doubles as the non-root node's outbox: the payload O it hands to the writer for the parent.
+    // It must not be c_16 (the child-O inbox). c_16 is pushed by the writer and popped by the unpacker;
+    // if the packer also pushed to it and the writer also popped it, the compute side's private
+    // cumulative counters (which it stores into the shared stream registers) and the dataflow side's
+    // increments would diverge after the first emit and the next child O would be invisible to the
+    // unpacker. That was the three-round hang of group-shared mode (issue 002). The stock kernel only
+    // survives the aliasing because each core emits once per launch.
     constexpr uint32_t cb_out_final = tt::CBIndex::c_20;
 
     // Palu CBs (spec §4). The stock owners of these slots must be compiled out; the program factory
@@ -629,7 +636,7 @@ void kernel_main() {
         } else if (has_parent) {
             // Emit this head's payload for the writer to send to the parent; the three CBs hold one
             // block each, so the next head waits here until the writer has sent and popped them.
-            move_block<true>(cb_o_head, cb_out_o, out_chunk_tiles);
+            move_block<true>(cb_o_head, cb_out_final, out_chunk_tiles);  // outbox, see cb_out_final
             move_block<true>(cb_m_head, cb_out_m, Sq_chunk_t);
             move_block<true>(cb_l_head, cb_out_l, Sq_chunk_t);
         }
@@ -1057,7 +1064,7 @@ void kernel_main() {
             //   - cb_prev_sum: L
             //   - cb_prev_max: M
             // Move O to output CB
-            move_block<true>(cb_out_accumulate_im, cb_out_o, out_chunk_tiles);
+            move_block<true>(cb_out_accumulate_im, cb_out_final, out_chunk_tiles);  // outbox, see cb_out_final
             // Move M to output CB
             move_block<true>(cb_prev_max, cb_out_m, Sq_chunk_t);
             // Move L to output CB
