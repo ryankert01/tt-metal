@@ -192,17 +192,17 @@ void kernel_main() {
 
     for (uint32_t c = p; c < NC; c += NP) {
         const uint32_t slot = c % NBUF;  // the receivers' reserved slot for GLOBAL chunk c (shared CBs)
-        // Wait for the chunk's outputs in the phased prep writer's drain order (roughly
-        // compute's push order), so producer-side backpressure matches that writer exactly.
+        // Wait for the chunk's outputs in the phased prep writer's drain order (compute's push
+        // order), so producer-side backpressure matches that writer exactly.
         {
             DeviceZoneScopedN("tx_wait_cb");
             CircularBuffer(cb_vbeta).wait_front(cv);
+            CircularBuffer(cb_qdecay).wait_front(ck);
+            CircularBuffer(cb_intra).wait_front(cc);
             CircularBuffer(cb_Tinv).wait_front(cc);
             CircularBuffer(cb_nkd).wait_front(ck);
-            CircularBuffer(cb_intra).wait_front(cc);
-            CircularBuffer(cb_qdecay).wait_front(ck);
-            CircularBuffer(cb_kdec_t).wait_front(kc);
             CircularBuffer(cb_dl).wait_front(1);
+            CircularBuffer(cb_kdec_t).wait_front(kc);
         }
 
         // All NV receivers of head h have reserved chunk c's slot. Exactly NV — an over-credit

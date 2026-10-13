@@ -199,10 +199,11 @@ tt::tt_metal::ProgramDescriptor ChunkGdnPrepProgramFactory::create_descriptor(
     constexpr uint32_t kPrepMaskTiles = 3;
     constexpr uint32_t kPrepOutBuf =
         2;  // two items of output capacity: the writer's DRAM drain of item i does not gate item i+1
-    // Scratch, sized to what prep_chunk holds (qwen36-gdn-cb-inventory.md): scr1 carries decay_row (Ct), the
-    // WY inverse's tmpN (1) and k_dec (ck); scr2 the inverse's tmpT (1); scr3 negN (cc) and the qk-norm's
-    // diagonal tile (Ct <= cc). supd/stmp hold the normalized q/k (ck) or, at Ct == 2, one diagonal inverse
-    // each; S/final_s/s2/s3 are invert_block's single-tile private scratch A..D; ointer is the Ct == 2
+    // Scratch, sized to what prep_chunk holds (qwen36-gdn-cb-inventory.md): scr1 carries decay_row (Ct) and the
+    // WY inverse's tmpN (1) -- it keeps its ck-tile size, but k_dec (a ck-tile block) goes through kbeta's ring;
+    // scr2 the inverse's tmpT (1); scr3 negN (cc) and the qk-norm's diagonal tile (Ct <= cc). supd/stmp hold the
+    // normalized q/k (ck) or, at Ct == 2, one diagonal inverse each; S/final_s/s2/s3 are invert_block's
+    // single-tile private scratch A..D (s3 also stages negN21 at Ct == 2); ointer is the Ct == 2
     // off-diagonal block; the vnew slot carries the one dl*I tile. Prep holds no [K,V] state, so nothing
     // here is kv-sized (the mono op's plan was, and prep inherited it: ~750 KB of idle L1 at K = V = 128).
     const uint32_t scr1_tiles = ck, scr2_tiles = 1, scr3_tiles = cc, qk_tiles = ck, one_tile = 1;

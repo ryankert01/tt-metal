@@ -68,15 +68,16 @@ void kernel_main() {
         cb.pop_front(n);
     };
 
-    // Drain roughly in the compute's push order (v_beta, t_inv, nkd, intra, q_decay, k_dec_t, dl).
+    // Drain in the compute's push order (prep_chunk: v_beta, q_decay, intra, t_inv, nkd, dl, k_dec_t), so each
+    // DRAM write starts as soon as its tiles exist and overlaps the rest of the item's compute.
     for (uint32_t i = 0; i < wi_count; i++) {
         const uint32_t hc = wi_start + i;  // flat (head, chunk) index
         drain(cb_vbeta, vb_acc, cv, hc * cv);
+        drain(cb_qdecay, qd_acc, ck, hc * ck);
+        drain(cb_intra, it_acc, cc, hc * cc);
         drain(cb_Tinv, ti_acc, cc, hc * cc);
         drain(cb_nkd, nkd_acc, ck, hc * ck);
-        drain(cb_intra, it_acc, cc, hc * cc);
-        drain(cb_qdecay, qd_acc, ck, hc * ck);
-        drain(cb_kdec_t, kc_acc, kc, hc * kc);
         drain(cb_dl, dl_acc, 1, hc * 1);
+        drain(cb_kdec_t, kc_acc, kc, hc * kc);
     }
 }
