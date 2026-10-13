@@ -4,6 +4,10 @@ Measured 2026-10-12 on top of `20e872e3b6`. Scope: the two compute kernels of
 `ttnn.transformer.chunk_gated_delta_rule` (`chunk_gdn_prep.cpp`, `chunk_gdn_scan.cpp`, both implemented in
 `device/kernels/compute/chunk_gdn_math.hpp`) and the two writers that drain the prep kernel.
 
+Update 2026-10-13: for upstreaming, the change is split into the branches `gdn-prep-fixes` (the two bug fixes)
+and `gdn-prep-scan-perf` (the performance work, stacked on it). Both trees were re-profiled back to back; see
+the note under the timing table.
+
 ## Summary
 
 - On a Wormhole n150 the prep kernel's per-chunk item is 16% faster (56.9 to 47.8 us), the scan step is up to 28%
@@ -56,8 +60,9 @@ instances per core dropped, fused program with 4 value heads, 8 chunks, NP = 2.
   roughly 25 to 26 us to 15.5 to 16.7 us, which is -36% to -39%. The range reflects whether the wait for the
   inverse's input is charged to the inverse zone or to the block before it.
 - The baseline figures for the 2-tile and 1-tile slices come from a build with the baseline scan code and an
-  intermediate version of the prep code. The scan kernel does not depend on the prep code, but these two baselines
-  are not from the pristine tree.
+  intermediate version of the prep code. Re-measured on 2026-10-13 against the bug-fix-only tree, three runs per
+  tree: prep item 56.9 to 47.8 us; scan step 12.03 to 8.67, 6.51 to 4.75 and 3.16 to 3.03 us; the fused-op
+  times below reproduce within 0.3%. The bug fixes alone change no timing.
 - A 1-tile slice gains almost nothing because the scan change removes repeated unpacks within a row of output
   tiles, and a 1-tile slice has one tile per row.
 
@@ -132,7 +137,7 @@ All comparisons are bitwise on the fp32 words, new build against baseline build,
 | Chunk 64, prep hand-off tensors | only `k_dec_t` and `dl` differ (the fix below) | only `k_dec_t` and `dl` differ |
 | Chunk 64, whole op against a torch reference | PCC 0.999995 (output), 0.999999 (final state) | same |
 | 16 repeated fused runs on each of the five geometries above, T = 2048 | identical run to run | not run |
-| LLK asserts and watcher enabled | prep passes (Horner path) | prep (SFPU solve) and fused op pass |
+| LLK asserts and watcher enabled, chunk 32 | plain prep prim passes; the other assert-enabled builds do not fit the kernel-config buffer | prep (SFPU solve and Horner) and fused op pass |
 
 Repo test files under the simulator: `test_chunk_gdn_prims.py` 9 passed, `test_chunk_gdn_fused_geometry.py` 271
 passed and 8 skipped, `test_chunk_gdn_fused.py` 71 passed and 15 skipped, `test_chunk_gated_delta_rule.py` 88 passed
@@ -220,9 +225,12 @@ linearly from the write pointer. The prep kernel pushed a 4-tile block into `scr
 block periodically ran past the end of the ring into the neighbouring scratch buffers. It was harmless only because
 those buffers happened to be idle at that moment.
 
-With `TT_METAL_LLK_ASSERTS=1` the baseline trips `CB push_back: fifo_wr_ptr would exceed fifo_limit` on the n150.
+With LLK asserts and the watcher on, the baseline trips `CB push_back: fifo_wr_ptr would exceed fifo_limit` on the
+prep kernel's pack thread under Blackhole ttsim. On the n150 the baseline's assert-enabled build does not fit the
+kernel-config buffer; the trip was first seen there on an intermediate build with the same push sequence.
 The 4-tile block now goes through `kbeta`'s ring, which only ever takes 4-tile pushes, and the chunk-64 path's one
-extra single-tile copy goes through `s3`. The assert-enabled runs are clean.
+extra single-tile copy goes through `s3`. The assert-enabled chunk-32 runs are clean. Chunk-64 builds with asserts
+exceed the buffer on both architectures, so that path's routing rests on the alignment argument, not on a run.
 
 ## Hardware and toolchain notes
 
