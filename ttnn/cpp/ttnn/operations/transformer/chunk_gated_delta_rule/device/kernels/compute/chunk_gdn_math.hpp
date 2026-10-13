@@ -195,7 +195,8 @@ inline void ew(uint32_t a, uint32_t b, uint32_t o, uint32_t n, EwOp op, bool ski
 // packed as is), DST3 (decay again, for the exp) and DST1 (g_sum); then SFPU: DST1 -= DST0, exp on DST1 and
 // DST3, and DST2 = DST1 * DST3 -- dl as the exact fp32 product of the two exps, not the broadcast product whose
 // rounded factors cost ~1e-3 on the value that decays the state every chunk. Packs: decay -> o_decay[i],
-// decay_exp -> o_exp[i], decayfac -> o_fac[i], dl -> o_fac[Ct] (from tile 0's window; every row holds g_sum).
+// decay_exp -> o_exp[i], decayfac -> o_fac[i], dl -> o_fac[Ct] (from the last tile's window; every row of every
+// window holds g_sum).
 inline void decay_all(
     uint32_t tril, uint32_t ones, uint32_t g, uint32_t o_decay, uint32_t o_exp, uint32_t o_fac, uint32_t Ct) {
     CircularBuffer(o_decay).reserve_back(Ct);
@@ -216,7 +217,7 @@ inline void decay_all(
         exp_tile_init();
         sfpu_exp_dst(1);  // decayfac_i
         sfpu_exp_dst(3);  // decay_exp_i
-        if (i == 0) {
+        if (i + 1 == Ct) {
             mul_binary_tile_init();
             sfpu_mul_dst(1, 3, 2);  // dl = decayfac_i * decay_exp_i = exp(g_sum)
         }
@@ -225,7 +226,9 @@ inline void decay_all(
         pack_tile(0, o_decay, i);
         pack_tile(3, o_exp, i);
         pack_tile(1, o_fac, i);
-        if (i == 0) {
+        if (i + 1 == Ct) {
+            // pack_tile fills o_fac in call order, whatever index it is given: dl is its last tile, so it is taken
+            // from the last window.
             pack_tile(2, o_fac, Ct);
         }
         tile_regs_release();
@@ -854,11 +857,11 @@ inline void prep_chunk(const GdnPrepCbs& cb, uint32_t scale_bits, uint32_t eps_b
                         cb.s3);
                 }
             }
-            cpy_t(cb.scr3, 2, cb.scr1);  // negN21 -> cb.scr1[0]
-            WAIT(cb.scr1, 1);
-            mm(cb.scr1, cb.supd, cb.scr2, 1, 1, 1, false);  // tmp = negN21 @ Mi11
+            cpy_t(cb.scr3, 2, cb.s3);  // negN21 -> cb.s3 (invert_block's scratch D, free again)
+            WAIT(cb.s3, 1);
+            mm(cb.s3, cb.supd, cb.scr2, 1, 1, 1, false);  // tmp = negN21 @ Mi11
             WAIT(cb.scr2, 1);
-            POP(cb.scr1, 1);
+            POP(cb.s3, 1);
             mm(cb.stmp, cb.scr2, cb.ointer, 1, 1, 1, false);  // Mi21 = Mi22 @ tmp
             WAIT(cb.ointer, 1);
             POP(cb.scr2, 1);
@@ -913,20 +916,23 @@ inline void prep_chunk(const GdnPrepCbs& cb, uint32_t scale_bits, uint32_t eps_b
     // decay_exp kept alive: reused at the scan to recompute dl = exp(g_sum).
     {
         GDN_ZONE("pp_kdec");
+        // k_dec = k * exp(decay_last - decay), staged in cb.kbeta's ring (k_beta was popped at pp_kd). A ck-tile
+        // block needs a ring whose pushes are all ck tiles: tiles are addressed linearly from the ring pointers,
+        // so in a ring that also takes single-tile pushes (cb.scr1) the block would run past the ring's end.
         WAIT(cb.decayfac, Ct + 1);
-        bcast_cols_mul(Kk, cb.decayfac, cb.scr1, ct, Kt);  // k * exp(decay_last-decay)
-        WAIT(cb.scr1, ck);
+        bcast_cols_mul(Kk, cb.decayfac, cb.kbeta, ct, Kt);
+        WAIT(cb.kbeta, ck);
         POP(Kk, ck);
         // decayfac kept alive: reused at the scan to recompute dl = exp(g_sum).
         // k_dec_t = transpose(k_dec) [K,C]: transpose each [Ct,Kt] tile block into [Kt,Ct].
         CircularBuffer(cb.kdec_t).reserve_back(Kt * Ct);
         pack_reconfig_data_format(cb.kdec_t);
-        reconfig_data_format_srca(cb.scr1);  // unary: in->srcA
-        transpose_init(cb.scr1);
+        reconfig_data_format_srca(cb.kbeta);  // unary: in->srcA
+        transpose_init(cb.kbeta);
         for (uint32_t ki = 0; ki < Kt; ki++) {
             for (uint32_t ci = 0; ci < Ct; ci++) {
                 tile_regs_acquire();
-                transpose_tile(cb.scr1, ci * Kt + ki, 0);
+                transpose_tile(cb.kbeta, ci * Kt + ki, 0);
                 tile_regs_commit();
                 tile_regs_wait();
                 pack_tile(0, cb.kdec_t, ki * Ct + ci);
@@ -934,7 +940,7 @@ inline void prep_chunk(const GdnPrepCbs& cb, uint32_t scale_bits, uint32_t eps_b
             }
         }
         CircularBuffer(cb.kdec_t).push_back(Kt * Ct);
-        POP(cb.scr1, ck);
+        POP(cb.kbeta, ck);
     }
 
     {
