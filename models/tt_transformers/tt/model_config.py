@@ -1485,6 +1485,9 @@ class ModelArgs:
     @lru_cache(maxsize=None)
     def get_attn_sdpa_decode_program_config(self, prefetcher: Prefetcher = None):
         """Get the SDPA program config for decode mode."""
+        # Ablation override: TT_SDPA_K_CHUNK_DECODE forces k_chunk_size; 0 keeps auto-flash.
+        # The env var is read once and cached via lru_cache; vary by restarting the process.
+        k_chunk_override = int(os.environ.get("TT_SDPA_K_CHUNK_DECODE", "0"))
         if prefetcher is not None:
             sdpa_grid_size = (8, 8)
             start_core = ttnn.CoreCoord(1, 0)
@@ -1496,14 +1499,14 @@ class ModelArgs:
                 ),
                 exp_approx_mode=False,
                 q_chunk_size=0,
-                k_chunk_size=0,
+                k_chunk_size=k_chunk_override,
             )
         else:
             return ttnn.SDPAProgramConfig(
                 compute_with_storage_grid_size=(8, 8),
                 exp_approx_mode=False,
                 q_chunk_size=0,
-                k_chunk_size=0,
+                k_chunk_size=k_chunk_override,
             )
 
     @lru_cache(maxsize=None)

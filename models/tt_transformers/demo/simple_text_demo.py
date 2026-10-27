@@ -147,6 +147,11 @@ def load_and_cache_context(context_url, cache_dir, max_length=None):
 
 # load input prompts from json, return as a list
 def load_inputs(user_input, batch, instruct):
+    # Ablation override: TT_DEMO_PROMPTS_OVERRIDE points to an alternate JSON; lets external
+    # drivers feed arbitrary prompts without modifying the parametrize selectors.
+    override = os.environ.get("TT_DEMO_PROMPTS_OVERRIDE")
+    if override:
+        user_input = override
     if isinstance(user_input, str):
         with open(user_input, "r") as f:
             user_input = json.load(f)
