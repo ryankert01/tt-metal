@@ -47,6 +47,38 @@ MAX_BATCHED_PREFILL_SEQ_LEN = 128 * 1024
 SUPPORTED_PREFILL_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
 
 
+def mask_page_table_columns_past_allocation(page_table, prompt_lens, block_size):
+    """Zero every page-table column past each request's own allocation; returns ``(table, zeroed)``.
+
+    vLLM tracks only the live prefix of a block-table row, and the vllm-tt-plugin releases before PR #169
+    (compat/vllm-0.25.1 included) hand the row over as is, so a row reused by a new request still carries
+    the previous occupant's block ids past ``ceil(prompt_len / block_size)`` (vllm-tt-plugin#168). Prefill
+    pads the prompt to the kernel length and ``paged_fill_cache`` writes whole rows through the table, so
+    those stale ids receive the padding -- and the new request's own block when the id is one of its own
+    (first token right, every decode token garbage). 0 is vLLM's null block, never allocated: route the
+    padding there, as the fixed plugin does. The input is not mutated; a clean table is returned as is.
+    """
+    if page_table is None or prompt_lens is None or not isinstance(page_table, torch.Tensor):
+        return page_table, 0
+    lens = [int(n) for n in (prompt_lens.tolist() if hasattr(prompt_lens, "tolist") else list(prompt_lens))]
+    table = page_table if page_table.dim() > 1 else page_table.unsqueeze(0)
+    masked, zeroed = None, 0
+    for r in range(min(int(table.shape[0]), len(lens))):
+        first_free = -(-max(lens[r], 0) // int(block_size))
+        if first_free >= int(table.shape[1]):
+            continue
+        stale = int((table[r, first_free:] != 0).sum())
+        if stale == 0:
+            continue
+        if masked is None:
+            masked = table.clone()
+        masked[r, first_free:] = 0
+        zeroed += stale
+    if masked is None:
+        return page_table, 0
+    return (masked if page_table.dim() > 1 else masked[0]), zeroed
+
+
 def batched_prefill_padded_batch(batch_size, empty_slots, max_batch_size):
     """Rows the batched-prefill device batch needs for ``empty_slots``.
 
@@ -1017,6 +1049,12 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
 
         if not isinstance(prompt_lens, list):
             prompt_lens = prompt_lens.tolist()
+
+        # Stale block ids past each row's allocation would receive the padded fill below (vllm-tt-plugin#168).
+        if page_table is not None and kv_cache is not None and kv_cache[0] is not None:
+            page_table, zeroed_cols = mask_page_table_columns_past_allocation(page_table, prompt_lens, get_block_size(kv_cache[0]))
+            if zeroed_cols:
+                logger.debug(f"Prefill page table: zeroed {zeroed_cols} stale column(s) past the prompt allocation")
 
         # Pad by uncached suffix length: only (seq_len - num_cached) tokens reach the kernel.
         # int() normalizes numpy.int64 from vLLM callers (bit_length() requires a Python int).
