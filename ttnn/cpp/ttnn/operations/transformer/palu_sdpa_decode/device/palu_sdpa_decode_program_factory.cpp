@@ -255,9 +255,14 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
         // The cost is that at batch <= 8 a group of four heads runs on 4 cores instead of 8, i.e. half
         // the grid idle there -- H = 2 keeps the grid full at that batch.
         // palu_tt.fused.group_heads_per_core models exactly this worst case (4 cores per head, 2 rounds).
-        constexpr uint32_t group_max_cores_per_head = 4;
-        // Debug override so the hang can be reproduced without a rebuild (report_issue/issue_002 and its
-        // script): PALU_GROUP_MAX_CORES_PER_ITEM raises the cap. Read once per program build, so set it
+        // 2026-10-28: that hang was fixed (75d4765: the stock kernel's output CB c_16 was pushed and popped
+        // from both the dataflow and the compute side, and their counters desynchronise on the second
+        // head of a node with two children and a parent), and stage 2g (docs/results/stage2g.md) measured
+        // the eight-core, three-round tree 17 to 30 % faster than the four-core one for a forced group
+        // layout at batch <= 8. The cap is therefore 8. The host selector (palu_tt.fused) still never picks
+        // group mode below batch 32, so no auto-selected program changes; only explicit heads_per_core runs do.
+        constexpr uint32_t group_max_cores_per_head = 8;
+        // Debug override (report_issue/issue_002 and its script): PALU_GROUP_MAX_CORES_PER_ITEM sets the cap. Read once per program build, so set it
         // before the first call in a process. Never set it in production.
         uint32_t cap = group_max_cores_per_head;
         if (const char* env = std::getenv("PALU_GROUP_MAX_CORES_PER_ITEM"); env != nullptr && *env != '\0') {
