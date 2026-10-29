@@ -125,6 +125,7 @@ Tensor palu_sdpa_decode(
     const tt::tt_metal::MemoryConfig& output_mem_config,
     const std::optional<ttnn::operations::transformer::SDPAProgramConfig>& program_config,
     ttnn::DeviceComputeKernelConfig compute_kernel_config,
-    uint32_t k_chunk_size);
+    uint32_t k_chunk_size,
+    const std::optional<const Tensor>& page_table = std::nullopt);  // stage 3: paged latent caches
 
 }  // namespace ttnn::prim

@@ -34,4 +34,28 @@ ttnn::Tensor palu_sdpa_decode(
     std::optional<operations::transformer::SDPAProgramConfig> program_config = std::nullopt,
     std::optional<DeviceComputeKernelConfig> compute_kernel_config = std::nullopt);
 
+// Stage 3: the same op over paged latent caches. k_latent / v_latent are
+// [max_num_blocks, n_groups, block_size, r] and page_table is [B, max_blocks_per_seq] int32 ROW_MAJOR
+// (interleaved); Phase 2 (rot_step, trans_mat) is required and the K chunk is pinned (default 128).
+// See docs/superpowers/specs/2026-10-29-palu-tt-stage3-design.md.
+ttnn::Tensor paged_palu_sdpa_decode(
+    const ttnn::Tensor& input_tensor_q,
+    const ttnn::Tensor& k_latent,
+    const ttnn::Tensor& w_rot,
+    const ttnn::Tensor& cs_tab,                  // [1, 1, >= k_chunk_size, 256] bf16 (Phase 2 reads the first chunk only)
+    const ttnn::Tensor& v_latent,
+    uint32_t head_dim_v,
+    const ttnn::Tensor& page_table,
+    const ttnn::Tensor& cur_pos_tensor,
+    const std::optional<const Tensor>& rot_step = std::nullopt,
+    const std::optional<const Tensor>& trans_mat = std::nullopt,
+    const std::optional<const Tensor>& u_v = std::nullopt,
+    std::optional<uint32_t> heads_per_core = std::nullopt,
+    const std::string& rot_mode = "dst",
+    bool table_mcast = true,
+    std::optional<float> scale = std::nullopt,
+    const std::optional<MemoryConfig>& memory_config = std::nullopt,
+    std::optional<operations::transformer::SDPAProgramConfig> program_config = std::nullopt,
+    std::optional<DeviceComputeKernelConfig> compute_kernel_config = std::nullopt);
+
 }  // namespace ttnn::transformer

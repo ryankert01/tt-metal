@@ -97,6 +97,75 @@ void read_palu_chunks(
     }
 }
 
+// ---------------- Paged latent cache (stage 3) ----------------
+// The latent caches are [max_num_blocks, n_lat_heads, block_size, r] and a user's blocks are listed in
+// its page-table row. One K chunk is still Sk_chunk_t tile rows of width_t tiles, laid out row-major
+// in the CB exactly as read_palu_chunks writes it (so compute is untouched); only where each tile row
+// comes from changes: virtual tile row -> page-table lookup -> physical tile id, then a contiguous run
+// of width_t tiles. The lookup is the stock paged flash-decode one (sdpa/.../dataflow_common.hpp).
+template <uint32_t cb_id, uint32_t barrier_threshold, uint32_t n_lat_heads, uint32_t block_size_t, uint32_t width_t,
+          typename ReaderT>
+void palu_read_paged_chunk(
+    uint32_t first_virtual_row, uint32_t Sk_chunk_t, uint32_t lat_head,
+    const volatile tt_l1_ptr uint32_t* page_table_ptr, const ReaderT& reader) {
+    Noc noc;
+    CircularBuffer cb(cb_id);
+    constexpr uint32_t tile_bytes = get_tile_size(cb_id);
+    const uint32_t n = Sk_chunk_t * width_t;
+    cb.reserve_back(n);
+    uint32_t wp = cb.get_write_ptr();
+    uint32_t barrier_count = 0;
+    for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
+        const uint32_t first_tile = virtual_seq_tile_id_to_physical_tile_id<uint32_t, n_lat_heads, block_size_t, width_t>(
+            first_virtual_row + row, lat_head, page_table_ptr);
+        for (uint32_t i = 0; i < width_t; ++i) {
+            noc.async_read(reader, CoreLocalMem<uint32_t>(wp), tile_bytes, {.page_id = first_tile + i}, {});
+            if (++barrier_count == barrier_threshold) {
+                noc.async_read_barrier();
+                barrier_count = 0;
+            }
+            wp += tile_bytes;
+        }
+    }
+    noc.async_read_barrier();
+    cb.push_back(n);
+}
+
+// Paged counterpart of read_palu_chunks (Phase 2 only: the chunk-relative angle table is resident, so
+// nothing per chunk is indexed by absolute position). Chunk k covers virtual tile rows
+// [k * Sk_chunk_t, (k + 1) * Sk_chunk_t).
+template <uint32_t Rt, uint32_t Rvt, uint32_t barrier_threshold, uint32_t cb_lat, uint32_t cb_v, uint32_t n_lat_heads,
+          uint32_t block_size_t, typename LatReaderT, typename VReaderT>
+void read_palu_chunks_paged(
+    uint32_t k_chunk_start, uint32_t k_chunk_end, uint32_t lat_head, uint32_t Sk_chunk_t,
+    const volatile tt_l1_ptr uint32_t* page_table_ptr, const LatReaderT& lat_reader, const VReaderT& v_reader) {
+    for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
+        const uint32_t first_row = k_chunk * Sk_chunk_t;
+        palu_read_paged_chunk<cb_lat, barrier_threshold, n_lat_heads, block_size_t, Rt>(
+            first_row, Sk_chunk_t, lat_head, page_table_ptr, lat_reader);
+        palu_read_paged_chunk<cb_v, barrier_threshold, n_lat_heads, block_size_t, Rvt>(
+            first_row, Sk_chunk_t, lat_head, page_table_ptr, v_reader);
+    }
+}
+
+// This core's page-table row, kept resident behind the Wt rot_step tiles in cb_rs (c_14). Every CB
+// slot is taken in the Palu program, and c_14 is written once and never popped (palu_step_q only waits
+// on its first Wt tiles), so `pages` extra pages behind rot_step are a safe home: the caller has
+// already pushed rot_step (directly or through the column multicast, which writes rot_step's bytes
+// only), so the write pointer sits right after it.
+template <uint32_t cb_rs, typename PageTableArgs>
+volatile tt_l1_ptr uint32_t* palu_read_page_table_row(
+    uint32_t pages, uint32_t batch_idx, const PageTableArgs& page_table_args, uint32_t page_table_addr,
+    uint32_t page_table_stick_size) {
+    Noc noc;
+    CircularBuffer cb(cb_rs);
+    cb.reserve_back(pages);
+    volatile tt_l1_ptr uint32_t* ptr =
+        read_page_table_for_batch(noc, cb_rs, batch_idx, page_table_args, page_table_addr, page_table_stick_size);
+    cb.push_back(pages);
+    return ptr;
+}
+
 // Phase 2 angle table and rot_step, multicast down a grid column (stage 2e). The column's leader reads
 // both from DRAM into its own CB region and writes them to the same L1 addresses on the num_dests
 // cores in the vertical range (x, y0..y1), then bumps their multicast semaphore; the receivers wait

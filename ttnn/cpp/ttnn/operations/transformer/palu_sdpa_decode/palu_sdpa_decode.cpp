@@ -37,7 +37,12 @@ inline uint32_t palu_get_chunk_size(uint32_t s) {
 
 namespace ttnn::transformer {
 
-ttnn::Tensor palu_sdpa_decode(
+namespace {
+// Shared body of the unpaged and the paged entry points. In paged mode k_latent/v_latent are
+// [max_num_blocks, n_groups, block_size, r] and the sequence the kernel indexes is virtual
+// (max_blocks_per_seq x block_size, from the page table); the chunk is pinned to 128 unless the caller
+// chose one, because the Phase 2 angle table is chunk-relative and resident (no dynamic chunking).
+ttnn::Tensor palu_sdpa_decode_impl(
     const ttnn::Tensor& input_tensor_q,
     const ttnn::Tensor& k_latent,
     const ttnn::Tensor& w_rot,
@@ -45,6 +50,7 @@ ttnn::Tensor palu_sdpa_decode(
     const ttnn::Tensor& v_latent,
     const uint32_t head_dim_v,
     const ttnn::Tensor& cur_pos_tensor,
+    const std::optional<const Tensor>& page_table,
     const std::optional<const Tensor>& rot_step,
     const std::optional<const Tensor>& trans_mat,
     const std::optional<const Tensor>& u_v,
@@ -58,8 +64,15 @@ ttnn::Tensor palu_sdpa_decode(
     [[maybe_unused]] auto arch = input_tensor_q.storage_type() == StorageType::DEVICE
                                      ? input_tensor_q.device()->arch()
                                      : ttnn::GetDefaultDevice()->arch();
+    const bool paged = page_table.has_value();
     uint32_t s = k_latent.logical_shape()[-2];
-    uint32_t k_chunk_size = palu_get_chunk_size(s);
+    if (paged) {
+        TT_FATAL(rot_step.has_value(), "paged_palu_sdpa_decode: Phase 2 (rot_step, trans_mat) is required in paged mode");
+        const uint32_t block_size = s;
+        TT_FATAL(block_size % 32 == 0, "paged_palu_sdpa_decode: block_size must be a multiple of 32, got {}", block_size);
+        s = page_table->padded_shape()[-1] * block_size;  // the virtual sequence length
+    }
+    uint32_t k_chunk_size = paged ? std::min<uint32_t>(128, s) : palu_get_chunk_size(s);
     if (program_config.has_value() && program_config.value().k_chunk_size > 0) {
         k_chunk_size = program_config.value().k_chunk_size;
         // assert chunk size must be power of 2 and multiple of 32
@@ -116,12 +129,69 @@ ttnn::Tensor palu_sdpa_decode(
     // angle table is streamed per chunk there, not held resident. Fold the switch away instead of
     // rejecting it, so a Phase 1 caller does not have to opt out of a default it cannot use.
     const bool table_mcast_eff = table_mcast && rot_step.has_value();
+    if (paged) {
+        TT_FATAL(
+            s % k_chunk_size == 0,
+            "paged_palu_sdpa_decode: max_blocks_per_seq x block_size ({}) must be a multiple of k_chunk_size ({})",
+            s,
+            k_chunk_size);
+    }
 
     return ttnn::prim::palu_sdpa_decode(
         input_tensor_q, k_latent, w_rot, cs_tab, v_latent, cur_pos_tensor, rot_step, trans_mat, u_v, head_dim_v,
         heads_per_core, rot_mode_id, table_mcast_eff, scale,
         memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG),
-        program_config, kernel_config_val, k_chunk_size);
+        program_config, kernel_config_val, k_chunk_size, page_table);
+}
+}  // namespace
+
+ttnn::Tensor palu_sdpa_decode(
+    const ttnn::Tensor& input_tensor_q,
+    const ttnn::Tensor& k_latent,
+    const ttnn::Tensor& w_rot,
+    const ttnn::Tensor& cs_tab,
+    const ttnn::Tensor& v_latent,
+    const uint32_t head_dim_v,
+    const ttnn::Tensor& cur_pos_tensor,
+    const std::optional<const Tensor>& rot_step,
+    const std::optional<const Tensor>& trans_mat,
+    const std::optional<const Tensor>& u_v,
+    std::optional<uint32_t> heads_per_core,
+    const std::string& rot_mode,
+    bool table_mcast,
+    std::optional<float> scale,
+    const std::optional<MemoryConfig>& memory_config,
+    std::optional<ttnn::operations::transformer::SDPAProgramConfig> program_config,
+    std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
+    return palu_sdpa_decode_impl(
+        input_tensor_q, k_latent, w_rot, cs_tab, v_latent, head_dim_v, cur_pos_tensor, std::nullopt, rot_step,
+        trans_mat, u_v, heads_per_core, rot_mode, table_mcast, scale, memory_config, program_config,
+        compute_kernel_config);
+}
+
+ttnn::Tensor paged_palu_sdpa_decode(
+    const ttnn::Tensor& input_tensor_q,
+    const ttnn::Tensor& k_latent,
+    const ttnn::Tensor& w_rot,
+    const ttnn::Tensor& cs_tab,
+    const ttnn::Tensor& v_latent,
+    const uint32_t head_dim_v,
+    const ttnn::Tensor& page_table,
+    const ttnn::Tensor& cur_pos_tensor,
+    const std::optional<const Tensor>& rot_step,
+    const std::optional<const Tensor>& trans_mat,
+    const std::optional<const Tensor>& u_v,
+    std::optional<uint32_t> heads_per_core,
+    const std::string& rot_mode,
+    bool table_mcast,
+    std::optional<float> scale,
+    const std::optional<MemoryConfig>& memory_config,
+    std::optional<ttnn::operations::transformer::SDPAProgramConfig> program_config,
+    std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
+    return palu_sdpa_decode_impl(
+        input_tensor_q, k_latent, w_rot, cs_tab, v_latent, head_dim_v, cur_pos_tensor,
+        std::optional<const Tensor>(page_table), rot_step, trans_mat, u_v, heads_per_core, rot_mode, table_mcast,
+        scale, memory_config, program_config, compute_kernel_config);
 }
 
 }  // namespace ttnn::transformer

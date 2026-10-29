@@ -272,9 +272,10 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
         }
 
         if (use_mla) {
-            TT_FATAL(
-                k_shape[3] == q_shape[3], "Q and K must have same hidden size, got {} and {}", k_shape[3], q_shape[3]);
-            if (tensor_args.v.has_value()) {
+            // Palu: K is the latent (width r_k, validated at the top), so the stock "K hidden == Q hidden"
+            // check does not apply; V's width is head_dim_v on the absorbed-V path and u_v's row count
+            // (checked at the top) when V is rebuilt on core.
+            if (tensor_args.v.has_value() && !operation_attributes.recon_v) {
                 TT_FATAL(
                     v_shape[3] == operation_attributes.head_dim_v.value(),
                     "V must have hidden size equal to head_dim_v, got {} and {}",
@@ -474,17 +475,53 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
     }
 
     // ---------------- Palu envelope (stage 2 spec §3) ----------------
-    TT_FATAL(operation_attributes.is_causal && !operation_attributes.paged_attention, "palu_sdpa_decode: causal, unpaged only");
+    TT_FATAL(operation_attributes.is_causal, "palu_sdpa_decode: causal only");
+    TT_FATAL(
+        operation_attributes.paged_attention == tensor_args.page_table_tensor.has_value(),
+        "palu_sdpa_decode: paged_attention and page_table go together");
     TT_FATAL(tensor_args.cur_pos_tensor.has_value(), "palu_sdpa_decode: cur_pos_tensor is required");
     TT_FATAL(
         !tensor_args.attn_mask.has_value() && !tensor_args.attention_sink.has_value() &&
-            !tensor_args.page_table_tensor.has_value() && !operation_attributes.sliding_window_size.has_value() &&
-            !operation_attributes.share_cache.value_or(false),
-        "palu_sdpa_decode: mask, sink, page table, sliding window and share_cache are outside the envelope");
+            !operation_attributes.sliding_window_size.has_value() && !operation_attributes.share_cache.value_or(false),
+        "palu_sdpa_decode: mask, sink, sliding window and share_cache are outside the envelope");
     TT_FATAL(tensor_args.q.layout() == Layout::TILE, "palu_sdpa_decode: Q must be TILE layout (c_10 is reused)");
     TT_FATAL(q_shape[1] <= 32, "palu_sdpa_decode: batch must be <= 32, got {}", q_shape[1]);
     const uint32_t r_k = k_shape[-1];
-    const uint32_t S = k_shape[2];
+    // S is the (virtual) sequence length the kernel indexes: the cache length, or in paged mode
+    // max_blocks_per_seq x block_size.
+    uint32_t S = k_shape[2];
+    if (operation_attributes.paged_attention) {
+        // ---------------- Stage 3: paged latent caches [max_num_blocks, n_groups, block_size, r] ----------------
+        const auto& pt = tensor_args.page_table_tensor.value();
+        const uint32_t block_size = k_shape[2];
+        S = pt.padded_shape()[-1] * block_size;
+        TT_FATAL(!pt.is_sharded(), "palu_sdpa_decode: paged mode takes an interleaved INT32 page table");
+        TT_FATAL(
+            pt.padded_shape()[0] == q_shape[1],
+            "palu_sdpa_decode: page table has {} rows, Q has batch {}",
+            pt.padded_shape()[0],
+            q_shape[1]);
+        TT_FATAL(
+            block_size % 32 == 0,
+            "palu_sdpa_decode: paged block_size must be a multiple of 32, got {}",
+            block_size);
+        TT_FATAL(
+            k_shape[0] == v_shape[0],
+            "palu_sdpa_decode: the K and V latent caches must hold the same number of blocks ({} vs {})",
+            k_shape[0],
+            v_shape[0]);
+        TT_FATAL(
+            operation_attributes.k_chunk_size > 0 && S % operation_attributes.k_chunk_size == 0,
+            "palu_sdpa_decode: paged mode needs a pinned k_chunk_size ({}) that divides max_blocks_per_seq x "
+            "block_size ({} x {}); dynamic chunking is not available (the chunk-relative angle table is resident)",
+            operation_attributes.k_chunk_size,
+            pt.padded_shape()[-1],
+            block_size);
+        TT_FATAL(
+            operation_attributes.cs_recurrence,
+            "palu_sdpa_decode: paged mode needs Phase 2 (rot_step and trans_mat): the page-table row is kept "
+            "behind rot_step in c_14");
+    }
     const uint32_t D_palu = q_shape[-1];
     auto expect = [](const Tensor& t, const char* name, std::initializer_list<uint32_t> shape, DataType dt) {
         TT_FATAL(t.storage_type() == StorageType::DEVICE && t.buffer() != nullptr, "palu_sdpa_decode: {} must be on device", name);
@@ -546,7 +583,15 @@ void PaluSdpaDecodeDeviceOperation::validate_on_program_cache_miss(
             hpg);
     }
     expect(tensor_args.cs_tab, "cs_tab", {1, 1, 0, 2 * D_palu}, DataType::BFLOAT16);
-    TT_FATAL(tensor_args.cs_tab.padded_shape()[2] >= S, "palu_sdpa_decode: cs_tab has {} rows, cache has {}", tensor_args.cs_tab.padded_shape()[2], S);
+    // Phase 2 reads only the first k_chunk_size rows (chunk-relative angles); Phase 1 streams absolute
+    // rows for the whole cache. In paged mode (Phase 2 only) the table therefore need not span the
+    // virtual sequence.
+    const uint32_t cs_rows_needed = operation_attributes.cs_recurrence ? operation_attributes.k_chunk_size : S;
+    TT_FATAL(
+        tensor_args.cs_tab.padded_shape()[2] >= cs_rows_needed,
+        "palu_sdpa_decode: cs_tab has {} rows, {} needed",
+        tensor_args.cs_tab.padded_shape()[2],
+        cs_rows_needed);
     if (operation_attributes.cs_recurrence) {
         TT_FATAL(tensor_args.trans_mat.has_value(), "palu_sdpa_decode: rot_step and trans_mat are optional together");
         expect(*tensor_args.rot_step, "rot_step", {1, 1, 32, 2 * D_palu}, DataType::FLOAT32);
@@ -639,7 +684,8 @@ Tensor palu_sdpa_decode(
     const tt::tt_metal::MemoryConfig& output_mem_config,
     const std::optional<ttnn::operations::transformer::SDPAProgramConfig>& program_config,
     ttnn::DeviceComputeKernelConfig compute_kernel_config,
-    uint32_t k_chunk_size) {
+    uint32_t k_chunk_size,
+    const std::optional<const Tensor>& page_table) {
     using OperationType = PaluSdpaDecodeDeviceOperation;
     // Palu G-LRD: the rotation weight is per KV head, the latent cache is per group.
     const uint32_t n_kv = w_rot.padded_shape()[1];
@@ -649,10 +695,11 @@ Tensor palu_sdpa_decode(
         "palu_sdpa_decode: heads_per_group must be an integer: w_rot has {} heads, k_latent {}",
         n_kv,
         n_groups);
-    // Stock attributes pinned to the envelope: causal, unpaged, MLA-style separate V, cur_pos from tensor.
+    // Stock attributes pinned to the envelope: causal, MLA-style separate V, cur_pos from tensor; paged
+    // when a page table is given (stage 3).
     auto operation_attributes = OperationType::operation_attributes_t{
         .is_causal = true,
-        .paged_attention = false,
+        .paged_attention = page_table.has_value(),
         .cur_pos = {},
         .scale = scale,
         .sliding_window_size = std::nullopt,
@@ -677,7 +724,7 @@ Tensor palu_sdpa_decode(
         .k = k_latent,
         .v = v_latent,
         .cur_pos_tensor = cur_pos_tensor,
-        .page_table_tensor = std::nullopt,
+        .page_table_tensor = page_table.has_value() ? std::optional<Tensor>(*page_table) : std::nullopt,
         .attn_mask = std::nullopt,
         .attention_sink = std::nullopt,
         .w_rot = w_rot,

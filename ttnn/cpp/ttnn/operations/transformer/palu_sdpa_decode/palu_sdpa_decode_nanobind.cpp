@@ -89,5 +89,45 @@ void bind_palu_sdpa_decode(nb::module_& mod) {
         nb::arg("memory_config") = nb::none(),
         nb::arg("program_config") = nb::none(),
         nb::arg("compute_kernel_config") = nb::none());
+
+    const auto* const paged_doc =
+        R"doc(
+        Stage 3: palu_sdpa_decode over paged latent caches. k_latent and v_latent are
+        [max_num_blocks, n_groups, block_size, r] (block_size a multiple of 32) and page_table is
+        [B, max_blocks_per_seq] int32 ROW_MAJOR, interleaved in DRAM, one row per batch slot; the
+        kernel indexes a virtual sequence of max_blocks_per_seq x block_size positions and looks each
+        32-row tile of a chunk up through the row, exactly like paged_scaled_dot_product_attention_decode.
+        Differences from the stock paged op: Phase 2 (rot_step, trans_mat) is required and the K chunk
+        is static -- 128 unless program_config.k_chunk_size pins another power of two that divides the
+        virtual sequence -- because the chunk-relative angle table is resident (no dynamic chunking).
+        cs_tab only needs the first k_chunk_size rows. Everything else (w_rot, u_v, heads_per_core,
+        rot_mode, table_mcast, the output shape) is as for palu_sdpa_decode; the arithmetic is the same,
+        so on the same latents the two ops are bit-identical at equal chunk. See
+        docs/superpowers/specs/2026-10-29-palu-tt-stage3-design.md.
+        )doc";
+
+    ttnn::bind_function<"paged_palu_sdpa_decode", "ttnn.transformer.">(
+        mod,
+        paged_doc,
+        &ttnn::transformer::paged_palu_sdpa_decode,
+        nb::arg("input_tensor_q").noconvert(),
+        nb::arg("k_latent").noconvert(),
+        nb::arg("w_rot").noconvert(),
+        nb::arg("cs_tab").noconvert(),
+        nb::arg("v_latent").noconvert(),
+        nb::arg("head_dim_v").noconvert(),
+        nb::arg("page_table").noconvert(),
+        nb::arg("cur_pos_tensor").noconvert(),
+        nb::kw_only(),
+        nb::arg("rot_step") = nb::none(),
+        nb::arg("trans_mat") = nb::none(),
+        nb::arg("u_v") = nb::none(),
+        nb::arg("heads_per_core") = nb::none(),
+        nb::arg("rot_mode") = "dst",
+        nb::arg("table_mcast") = true,
+        nb::arg("scale") = nb::none(),
+        nb::arg("memory_config") = nb::none(),
+        nb::arg("program_config") = nb::none(),
+        nb::arg("compute_kernel_config") = nb::none());
 }
 }  // namespace ttnn::operations::transformer

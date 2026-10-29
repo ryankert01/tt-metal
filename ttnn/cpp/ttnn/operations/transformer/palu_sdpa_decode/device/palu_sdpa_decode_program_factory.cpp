@@ -710,24 +710,21 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
             is_cur_pos_tensor_sharded ? cur_pos_buffer : nullptr);
         add_cb(CBIndex::c_15, cur_pos_stick_size, cur_pos_df, cur_pos_stick_size);
     }
-    if (is_paged_attention) {
-        uint32_t page_table_cb_size = is_page_table_sharded ? B * page_table_stick_size : page_table_stick_size;
-        add_cb(
-            CBIndex::c_9,
-            page_table_cb_size,
-            page_table_df,
-            page_table_stick_size,
-            nullptr,
-            is_page_table_sharded ? page_table_buffer : nullptr);
-    }
     // ---------------- Palu CBs (spec §4) ----------------
     // The stock owners of these slots (row-major Q c_10, sink c_4, page table c_9, sliding window c_13,
     // block padding c_14, zero scalar c_12) are outside the envelope and are never allocated here.
+    // Stage 3: in paged mode the page table does NOT get the stock c_9 (that is the latent chunk); its
+    // row rides behind rot_step in c_14, so paged mode needs Phase 2 and an interleaved page table.
     TT_FATAL(
-        !use_attention_sink && !is_paged_attention && !tilize_q && sliding_window_size == 0 && !has_block_padding,
+        !use_attention_sink && !tilize_q && sliding_window_size == 0 && !has_block_padding,
         "palu_sdpa_decode: the Palu CBs reuse the sink (c_4), page table (c_9), row-major Q (c_10), zero "
         "scalar (c_12), sliding window (c_13) and block padding (c_14) slots; none of those stock features "
         "may be enabled");
+    TT_FATAL(
+        !is_paged_attention || (phase2 && !is_page_table_sharded && page_table_df == tt::DataFormat::Int32),
+        "palu_sdpa_decode: paged mode needs Phase 2 (rot_step) and an interleaved INT32 page table (the row "
+        "is kept behind rot_step in c_14)");
+    (void)page_table_df;
     const uint32_t lat_tiles = Sk_chunk_t_cb_size * Rt * 2;                                  // latent chunk, double buffered
     // One head's [u_k | u_k T], plus the T tile itself in Phase 2. The reader writes a push linearly
     // from the CB write pointer, so the CB size must stay a multiple of the push granule -- a core that
@@ -770,8 +767,12 @@ ProgramDescriptor PaluSdpaDecodeDeviceOperation::create_descriptor(
         // rotated-query state, fp32: [q~ | q~ T] pushed and popped as one 2n block (palu_step_q), with
         // room for the next block -- 4n keeps every block contiguous, so an operand index never wraps.
         add_cb(CBIndex::c_12, 4 * q_tiles * fp32_tile_size, tt::DataFormat::Float32, fp32_tile_size, &full_tile);
-        // [cos(c f) | sin(c f)] on every row, resident for the run
-        add_cb(CBIndex::c_14, Wt * fp32_tile_size, tt::DataFormat::Float32, fp32_tile_size, &full_tile);
+        // [cos(c f) | sin(c f)] on every row, resident for the run. Stage 3: in paged mode this core's
+        // page-table row (one stick, max_blocks_per_seq int32) sits in whole pages behind those Wt tiles;
+        // the CB is written once and never popped, and the column multicast writes rot_step's bytes only.
+        const uint32_t page_table_pages =
+            is_paged_attention ? (page_table_stick_size + fp32_tile_size - 1) / fp32_tile_size : 0;
+        add_cb(CBIndex::c_14, (Wt + page_table_pages) * fp32_tile_size, tt::DataFormat::Float32, fp32_tile_size, &full_tile);
     }
 
     // Scalar/identity CBs

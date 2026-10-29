@@ -69,6 +69,7 @@ void kernel_main() {
     constexpr bool recon_v = get_compile_time_arg_val(40) == 1;         // V rebuilt on core from u_v
     constexpr uint32_t Rvt = get_compile_time_arg_val(41);              // V latent width in tiles
     constexpr uint32_t Wt = 2 * DHt;
+    constexpr uint32_t n_lat_heads = num_kv_heads / heads_per_group;  // latent groups per batch (G-LRD: < num_kv_heads)
 
     constexpr auto q_args = TensorAccessorArgs<42>();
     constexpr auto k_args = TensorAccessorArgs<q_args.next_compile_time_args_offset()>();
@@ -86,7 +87,10 @@ void kernel_main() {
     // The Palu CBs below reuse slots whose stock owners must be compiled out (spec §4); the program
     // factory refuses to build otherwise, and these assert the kernel side of that contract.
     static_assert(!use_attention_sink, "Palu reuses the attention-sink CB (c_4) for w_rot");
-    static_assert(!is_paged_attention, "Palu reuses the page-table CB (c_9) for the latent chunk");
+    // Stage 3: paged latent caches. c_9 stays the latent chunk; the page-table row rides behind rot_step
+    // in c_14, which exists in Phase 2 only (see palu_read_page_table_row).
+    static_assert(!is_paged_attention || phase2, "paged palu_sdpa_decode needs Phase 2 (rot_step): the page table lives behind it in c_14");
+    static_assert(!is_paged_attention || !is_page_table_sharded, "paged palu_sdpa_decode: interleaved page table only");
     static_assert(sliding_window_size == 0, "Palu reuses the sliding-window CB (c_13) for [cos | sin]");
     static_assert(!has_block_padding, "Palu reuses the block-padding CB (c_14) for rot_step");
 
@@ -99,7 +103,6 @@ void kernel_main() {
     // Using one shared CB races — whichever consumer pops first drains the
     // count and the other hangs waiting for tiles. Each consumer gets its own CB.
     constexpr uint32_t cb_writer_cur_pos = tt::CBIndex::c_8;
-    constexpr uint32_t cb_id_page_table = tt::CBIndex::c_9;
     constexpr uint32_t cb_q_rm = tt::CBIndex::c_10;
     constexpr uint32_t cb_compute_cur_pos = tt::CBIndex::c_15;
     // Palu CBs (spec §4); the stock owners of these slots are compiled out in the envelope.
@@ -249,18 +252,11 @@ void kernel_main() {
     uint32_t output_core_noc_y = all_output_noc_y[cur_batch];
 
     constexpr uint32_t q_chunk_tiles = PNHt * DHt;
-    uint32_t k_chunk_tiles = Sk_chunk_t_dynamic * DHt;
-    uint32_t v_chunk_tiles = Sk_chunk_t_dynamic * vDHt;
-    uint32_t mask_chunk_tiles = PNHt * Sk_chunk_t_dynamic;
 
     constexpr uint32_t onetile = 1;
     constexpr uint32_t q_tile_bytes = get_tile_size(cb_q_in);
-    constexpr uint32_t k_tile_bytes = get_tile_size(cb_k_in);
-    constexpr uint32_t v_tile_bytes = get_tile_size(cb_v_in);
-    constexpr uint32_t mask_tile_bytes = get_tile_size(cb_mask_in);
     constexpr uint32_t attention_sink_tile_bytes = get_tile_size(cb_attention_sink);
     constexpr uint32_t barrier_threshold = get_barrier_read_threshold<q_tile_bytes, num_cores>();
-    uint32_t barrier_count = 0;
 
     // Read Q entirely - always read into cb_q_in
     // When tilize_q is true, compute will tilize back to cb_q_in
@@ -282,8 +278,6 @@ void kernel_main() {
     const auto k_reader = TensorAccessor(k_args, k_addr);
 
     const auto v_reader = TensorAccessor(v_args, v_addr);
-
-    const auto mask_reader = TensorAccessor(mask_args, mask_addr);
 
     const auto w_rot_reader = TensorAccessor(w_rot_args, w_rot_addr);
     const auto cs_reader = TensorAccessor(cs_args, cs_addr);
@@ -326,31 +320,14 @@ void kernel_main() {
         cb_sink.push_back(PNHt);
     }
 
-    // Read page table
-    volatile tt_l1_ptr uint32_t* page_table_ptr;
-    uint32_t page_table_cb_wr_ptr = 0;
-    volatile tt_l1_ptr uint16_t* page_table_ptr_u16 = nullptr;
-    volatile tt_l1_ptr uint32_t* page_table_ptr_u32 = nullptr;
+    // Stage 3: this batch's page-table row, resident behind rot_step in c_14 (rot_step has been pushed
+    // by now on both the multicast and the direct path above).
+    volatile tt_l1_ptr uint32_t* page_table_ptr = nullptr;
     if constexpr (is_paged_attention) {
-        CircularBuffer cb_page_table(cb_id_page_table);
-        uint32_t num_pages_to_read = is_page_table_sharded ? B : 1;
-        cb_page_table.reserve_back(num_pages_to_read);
-        // Read page table from DRAM
-        if constexpr (!is_page_table_sharded) {
-            page_table_ptr = read_page_table_for_batch(
-                noc,
-                cb_id_page_table,
-                cur_batch / q_heads_parallel_factor,
-                page_table_args,
-                page_table_addr,
-                page_table_page_size);
-            page_table_ptr_u32 = page_table_ptr;
-        } else {  // Read page table from dynamically allocated L1 buffer
-            page_table_cb_wr_ptr =
-                cb_page_table.get_write_ptr() + (cur_batch / q_heads_parallel_factor) * page_table_page_size;
-            page_table_ptr_u16 = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(page_table_cb_wr_ptr);
-        }
-        cb_page_table.push_back(num_pages_to_read);
+        constexpr uint32_t rs_tile_bytes = get_tile_size(cb_rot_step);
+        const uint32_t pages = (page_table_page_size + rs_tile_bytes - 1) / rs_tile_bytes;
+        page_table_ptr = palu_read_page_table_row<cb_rot_step>(
+            pages, cur_batch / q_heads_parallel_factor, page_table_args, page_table_addr, page_table_page_size);
     }
 
 #ifdef PALU_GROUP_SHARED
@@ -361,7 +338,6 @@ void kernel_main() {
     // (batch, core) and was already read above. The weight blocks are pushed head by head and stay
     // resident in c_4 for the run; compute indexes block h from the CB base.
     {
-        static_assert(!is_paged_attention, "group-shared mode is the unpaged Palu path");
         const uint32_t head_base = cur_head_group * num_heads_per_core;
         const uint32_t lat_head = head_base / heads_per_group;  // the group's latent
         ASSERT((head_base + num_heads_per_core - 1) / heads_per_group == lat_head);
@@ -369,100 +345,43 @@ void kernel_main() {
             read_w_rot<cb_w_rot, Rt, Wt, Rvt, DHt, barrier_threshold, phase2, recon_v>(
                 head_base + h, w_rot_reader, u_v_reader, trans_mat_reader);
         }
-        const uint32_t n_lat_heads = num_kv_heads / heads_per_group;
-        const uint32_t lat_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * n_lat_heads * St * Rt;
-        const uint32_t lat_start_tile_id =
-            lat_batch_offset + lat_head * St * Rt + k_chunk_start * Sk_chunk_t_dynamic * Rt;
-        const uint32_t v_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * n_lat_heads * St * Rvt;
-        const uint32_t v_start_tile_id =
-            v_batch_offset + lat_head * St * Rvt + k_chunk_start * Sk_chunk_t_dynamic * Rvt;
-        read_palu_chunks<Rt, Rvt, Wt, barrier_threshold, cb_lat_in, cb_v_in, cb_cs_in, phase2>(
-            k_chunk_start, k_chunk_end, lat_start_tile_id, v_start_tile_id, Sk_chunk_t_dynamic,
-            k_reader, v_reader, cs_reader);
+        if constexpr (is_paged_attention) {
+            read_palu_chunks_paged<Rt, Rvt, barrier_threshold, cb_lat_in, cb_v_in, n_lat_heads, block_size_t>(
+                k_chunk_start, k_chunk_end, lat_head, Sk_chunk_t_dynamic, page_table_ptr, k_reader, v_reader);
+        } else {
+            const uint32_t lat_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * n_lat_heads * St * Rt;
+            const uint32_t lat_start_tile_id =
+                lat_batch_offset + lat_head * St * Rt + k_chunk_start * Sk_chunk_t_dynamic * Rt;
+            const uint32_t v_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * n_lat_heads * St * Rvt;
+            const uint32_t v_start_tile_id =
+                v_batch_offset + lat_head * St * Rvt + k_chunk_start * Sk_chunk_t_dynamic * Rvt;
+            read_palu_chunks<Rt, Rvt, Wt, barrier_threshold, cb_lat_in, cb_v_in, cb_cs_in, phase2>(
+                k_chunk_start, k_chunk_end, lat_start_tile_id, v_start_tile_id, Sk_chunk_t_dynamic,
+                k_reader, v_reader, cs_reader);
+        }
     }
 #else
     for (uint32_t cur_head = cur_head_group * num_heads_per_core;
          cur_head < cur_head_group * num_heads_per_core + num_heads_per_core;
          ++cur_head) {
-        const uint32_t mask_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bmask) * PNHt * St;
-        const uint32_t mask_chunk_offset = k_chunk_start * Sk_chunk_t_dynamic;
-        uint32_t mask_start_tile_id = mask_batch_offset + mask_chunk_offset;
-        // Setup multicast parameters for K streaming (vertical multicast)
-        KMcastParams k_mcast_params = {
-            .do_mcast = do_k_mcast,
-            .mcast_x = mcast_x,
-            .mcast_y0 = mcast_y0,
-            .mcast_y1 = mcast_y1,
-            .num_dests = num_dests,
-            .mcast_sem_id = k_mcast_semaphore_id};
-
+        // ---------------- Palu: latent chunks + rotation tables instead of K chunks ----------------
+        // G-LRD: this head's latents live in its group's slice of the cache; the weights stay per head.
+        const uint32_t lat_head = cur_head / heads_per_group;                 // the group's latent
+        read_w_rot<cb_w_rot, Rt, Wt, Rvt, DHt, barrier_threshold, phase2, recon_v>(
+            cur_head, w_rot_reader, u_v_reader, trans_mat_reader);
         if constexpr (is_paged_attention) {
-            for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
-                const uint32_t k_chunk_start_row_num = k_chunk * Sk_chunk_t_dynamic;
-                uint64_t k_base_read_ptr;
-
-                // Read K chunk - supports both multicast and non-multicast paths
-                k_base_read_ptr = read_k<
-                    cb_k_in,
-                    DHt,
-                    num_kv_heads,
-                    block_size_t,
-                    k_tile_bytes,
-                    barrier_threshold,
-                    is_page_table_sharded,
-                    use_k_mcast,
-                    capacity_t>(
-                    k_chunk_tiles,
-                    cur_head,
-                    Sk_chunk_t_dynamic,
-                    k_chunk_start_row_num,
-                    k_reader,
-                    page_table_ptr_u16,
-                    page_table_ptr_u32,
-                    barrier_count,
-                    k_mcast_params);
-
-                if constexpr (use_attention_mask) {
-                    mask_start_tile_id = read_mask_chunk<cb_mask_in, mask_tile_bytes, barrier_threshold, PNHt>(
-                        PSt, Sk_chunk_t_dynamic, mask_chunk_tiles, mask_start_tile_id, mask_reader);
-                }
-                // Read V chunk - either from DRAM or from K's L1 buffer (transpose) when reuse_k is true
-                read_v<
-                    cb_v_in,
-                    vDHt,
-                    num_kv_heads,
-                    block_size_t,
-                    v_tile_bytes,
-                    barrier_threshold,
-                    is_page_table_sharded,
-                    reuse_k,
-                    capacity_t>(
-                    v_chunk_tiles,
-                    cur_head,
-                    Sk_chunk_t_dynamic,
-                    k_chunk_start_row_num,
-                    v_reader,
-                    page_table_ptr_u16,
-                    page_table_ptr_u32,
-                    barrier_count,
-                    k_base_read_ptr,
-                    k_tile_bytes);
-            }
+            // Stage 3: the same chunks, each tile row found through the page table.
+            read_palu_chunks_paged<Rt, Rvt, barrier_threshold, cb_lat_in, cb_v_in, n_lat_heads, block_size_t>(
+                k_chunk_start, k_chunk_end, lat_head, Sk_chunk_t_dynamic, page_table_ptr, k_reader, v_reader);
         } else {
-            // ---------------- Palu: latent chunks + rotation tables instead of K chunks ----------------
-            // G-LRD: this head's latents live in its group's slice of the cache; the weights stay per head.
-            const uint32_t lat_head = cur_head / heads_per_group;                 // the group's latent
-            const uint32_t n_lat_heads = num_kv_heads / heads_per_group;
             const uint32_t lat_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * n_lat_heads * St * Rt;
             const uint32_t lat_head_offset = lat_head * St * Rt;
             const uint32_t lat_start_tile_id = lat_batch_offset + lat_head_offset + k_chunk_start * Sk_chunk_t_dynamic * Rt;
             const uint32_t v_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * n_lat_heads * St * Rvt;
             const uint32_t v_head_offset = lat_head * St * Rvt;
             const uint32_t v_start_tile_id = v_batch_offset + v_head_offset + k_chunk_start * Sk_chunk_t_dynamic * Rvt;
-            read_w_rot<cb_w_rot, Rt, Wt, Rvt, DHt, barrier_threshold, phase2, recon_v>(
-                cur_head, w_rot_reader, u_v_reader, trans_mat_reader);
-            // read_palu_chunks's v_width_t is the V row width in DRAM: here it's Rvt (the V latent's own
-            // width), not vDHt (the compile-time V head dim used by the stock paged-attention path above).
+            // read_palu_chunks's v_width_t is the V row width in DRAM: Rvt (the V latent's own width), not
+            // vDHt (the compile-time V head dim of the stock op).
             read_palu_chunks<Rt, Rvt, Wt, barrier_threshold, cb_lat_in, cb_v_in, cb_cs_in, phase2>(
                 k_chunk_start, k_chunk_end, lat_start_tile_id, v_start_tile_id, Sk_chunk_t_dynamic,
                 k_reader, v_reader, cs_reader);
