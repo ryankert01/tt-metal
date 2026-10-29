@@ -650,8 +650,12 @@ class ModelArgs:
         # test_non_uniform_seeding). Forcing per-user batch-1 prefill removes the
         # variance. Workaround until the prefill kernels are batch-invariant.
         # Disabled for Qwen3-32B (P150x4) and Llama-3.1-8B (P300/P150x4/P150x8).
+        # N300 added (palu-sdpa fork): served through vllm-tt-plugin with the 131072-token pool, a batched
+        # prefill of 1024-token prompts padded to 32 users allocates 32768-row activations (896 MiB for one
+        # MLP output) and runs the 12 GB chip out of DRAM; per-user prefill also removes the batch-size
+        # variance above, which showed up as greedy answers drifting above four concurrent requests.
         self.disable_batched_prefill = (self.base_model_name == "Qwen3-32B" and self.device_name == "P150x4") or (
-            self.base_model_name == "Llama-3.1-8B" and self.device_name in ("P150", "P300", "P150x4", "P150x8")
+            self.base_model_name == "Llama-3.1-8B" and self.device_name in ("P150", "P300", "P150x4", "P150x8", "N300")
         )
 
         if (
